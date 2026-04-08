@@ -109,7 +109,10 @@ fun MetronomeScreen(
                 Spacer(Modifier.height(20.dp))
 
                 // ── BPM Dial ─────────────────────────────────────────────
-                BpmDialComponent(bpm = uiState.bpm)
+                BpmDialComponent(
+                    bpm = uiState.bpm,
+                    onBpmChange = viewModel::onBpmChange
+                )
 
                 Spacer(Modifier.height(28.dp))
 

@@ -1,6 +1,7 @@
 package com.pitchandmetronome.metronome.ui
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -63,13 +64,43 @@ private fun tempoMarking(bpm: Int): String = when {
 }
 
 /**
+ * Converts a touch position to an angle on the arc (0..270), where
+ * 0 = arc start (bottom-left, 135° in standard coords) and
+ * 270 = arc end (bottom-right, 405° in standard coords).
+ * Returns null if the touch is in the dead-zone (the 90° gap at the bottom).
+ */
+private fun positionToArcAngle(x: Float, y: Float, centerX: Float, centerY: Float): Float? {
+    val dx = x - centerX
+    val dy = y - centerY
+    // atan2 gives angle from positive X axis, clockwise in screen coords
+    var degrees = Math.toDegrees(kotlin.math.atan2(dy.toDouble(), dx.toDouble())).toFloat()
+    if (degrees < 0f) degrees += 360f // normalize to 0..360
+
+    // The arc starts at 135° and sweeps 270° clockwise (to 405° = 45°).
+    // Map standard angle to arc-relative angle:
+    //   arc 0   = 135° standard
+    //   arc 270 = 405° (= 45°) standard
+    // Dead zone: 45° to 135° standard (the bottom gap)
+    val arcAngle = degrees - 135f
+    val normalized = if (arcAngle < 0f) arcAngle + 360f else arcAngle
+
+    // If normalized > 270, the touch is in the dead zone
+    return if (normalized <= 270f) normalized else null
+}
+
+/**
  * Circular BPM dial with accent ring and tempo marking.
- * Only displays the dial — play, +/-, and reset buttons live in [MetronomeScreen].
+ *
+ * Supports **angular drag** gesture: the user drags along the arc path
+ * (clockwise = increase BPM, counter-clockwise = decrease BPM).
+ * The touch position is converted to an angle on the arc and mapped
+ * directly to BPM.
  */
 @Composable
 fun BpmDialComponent(
     modifier: Modifier = Modifier,
-    bpm: Int
+    bpm: Int,
+    onBpmChange: (Int) -> Unit = {}
 ) {
     val appColors = LocalAppColors.current
     val goldAccent = appColors.metronomeAccent
@@ -84,9 +115,33 @@ fun BpmDialComponent(
             (AudioEngineConfig.METRONOME_BPM_MAX - AudioEngineConfig.METRONOME_BPM_MIN)).coerceIn(0f, 1f)
     }
 
+    // ── Angular drag gesture state ───────────────────────────────────────
+    val currentOnBpmChange = rememberUpdatedState(onBpmChange)
+
     Box(
         contentAlignment = Alignment.Center,
-        modifier = modifier.size(220.dp)
+        modifier = modifier
+            .size(220.dp)
+            .pointerInput(Unit) {
+                val centerX = size.width / 2f
+                val centerY = size.height / 2f
+                val bpmRange = AudioEngineConfig.METRONOME_BPM_MAX - AudioEngineConfig.METRONOME_BPM_MIN
+
+                detectDragGestures(
+                    onDrag = { change, _ ->
+                        change.consume()
+                        val arcAngle = positionToArcAngle(
+                            change.position.x, change.position.y,
+                            centerX, centerY
+                        ) ?: return@detectDragGestures
+
+                        val fraction = (arcAngle / 270f).coerceIn(0f, 1f)
+                        val newBpm = (AudioEngineConfig.METRONOME_BPM_MIN + (fraction * bpmRange).toInt())
+                            .coerceIn(AudioEngineConfig.METRONOME_BPM_MIN, AudioEngineConfig.METRONOME_BPM_MAX)
+                        currentOnBpmChange.value(newBpm)
+                    }
+                )
+            }
     ) {
         Canvas(modifier = Modifier.size(220.dp)) {
             val strokeW = 6.dp.toPx()
