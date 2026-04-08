@@ -1,0 +1,28 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!--
+        Metronome:
+        - Trapezoidal body: wide base (4,22)-(20,22), narrow top (8,4)-(16,4)
+        - Pendulum rod from center-top (12,4) to bottom-right area
+        - Small dot at pivot point (12,13)
+    -->
+    <!-- Body outline -->
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="
+            M8,4 L4,22 L20,22 L16,4 Z
+            M9.5,5.5 L7,20.5 L17,20.5 L14.5,5.5 Z"
+        android:fillType="evenOdd"/>
+    <!-- Pendulum rod -->
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M11.3,13.7 L15.5,7 L16.8,7.8 L12.7,14.3 Z"/>
+    <!-- Pivot dot -->
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M12,15 A1.5,1.5 0 1,1 12,12 A1.5,1.5 0 1,1 12,15 Z"/>
+</vector>
+

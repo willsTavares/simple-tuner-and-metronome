@@ -1,0 +1,74 @@
+# ===== Build outputs =====
+*.apk
+*.aar
+*.ap_
+*.aab
+*.dex
+*.class
+bin/
+gen/
+out/
+release/
+
+# ===== Gradle =====
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# ===== Kotlin =====
+.kotlin/
+
+# ===== Local configuration =====
+local.properties
+
+# ===== IDE — IntelliJ / Android Studio =====
+.idea/
+*.iml
+*.iws
+*.ipr
+.navigation/
+captures/
+
+# ===== ProGuard =====
+proguard/
+
+# ===== Logs & JVM crash dumps =====
+*.log
+hs_err_pid*
+replay_pid*
+
+# ===== Native build =====
+.externalNativeBuild/
+.cxx/
+
+# ===== Keystore =====
+*.jks
+*.keystore
+
+# ===== Google Services =====
+google-services.json
+
+# ===== Fastlane =====
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+fastlane/readme.md
+
+# ===== Lint =====
+lint/intermediates/
+lint/generated/
+lint/outputs/
+lint/tmp/
+
+# ===== OS-specific =====
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# ===== Freeline =====
+freeline.py
+freeline/
+freeline_project_description.json
