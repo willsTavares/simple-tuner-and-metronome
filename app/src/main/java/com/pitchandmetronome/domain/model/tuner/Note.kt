@@ -16,6 +16,6 @@ data class Note(
     val referenceFrequency: Float,
     val centsDeviation: Float
 ) {
-    /** Representação completa: "A4", "C#3", etc. */
-    val fullName: String get() = "$name$octave"
+    /** Representação completa: "A4", "C#3", etc. Pré-computado para evitar concatenação no hot path. */
+    val fullName: String = "$name$octave"
 }

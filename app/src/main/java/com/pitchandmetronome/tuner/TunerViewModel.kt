@@ -43,24 +43,56 @@ class TunerViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(TunerUiState())
     val uiState: StateFlow<TunerUiState> = _uiState.asStateFlow()
 
+    // ── Campos de deduplicação — evitam copy() quando nada mudou ─────────
+    // Comparações primitivas (Float/String) são muito mais baratas do que
+    // alocar um novo TunerUiState via copy() a cada frame (~12×/s).
+    @Volatile private var lastNote: String = "--"
+    @Volatile private var lastCents: Float = 0f
+    @Volatile private var lastConfidence: Float = 0f
+    @Volatile private var silenceEmitted: Boolean = true
+
     init {
-        // Traduz PitchResult → campos da UI
+        // Traduz PitchResult → campos da UI.
+        // Otimização: só emite novo estado quando os valores mudam de forma
+        // perceptível para a UI. Thresholds:
+        //   - nota: mudança de nome (String identity via ===, fullName é pré-computado)
+        //   - cents: mudança > 0.5 cent (imperceptível abaixo disso)
+        //   - confiança: mudança > 0.02 (2% — invisível na UI)
         observePitch()
             .onEach { result ->
                 if (result != null) {
-                    _uiState.update { ui ->
-                        ui.copy(
-                            detectedNote = result.note.fullName,
-                            detectedFrequency = result.detectedFrequency,
-                            centsDeviation = result.note.centsDeviation,
-                            confidence = result.confidence,
-                            micLevel = result.confidence.coerceIn(0f, 1f)
-                        )
+                    silenceEmitted = false
+                    val noteName = result.note.fullName
+                    val cents = result.note.centsDeviation
+                    val conf = result.confidence
+
+                    // Deduplica: só aloca novo TunerUiState se algo mudou visivelmente
+                    val noteChanged = noteName !== lastNote
+                    val centsChanged = kotlin.math.abs(cents - lastCents) > CENTS_CHANGE_THRESHOLD
+                    val confChanged = kotlin.math.abs(conf - lastConfidence) > CONFIDENCE_CHANGE_THRESHOLD
+
+                    if (noteChanged || centsChanged || confChanged) {
+                        lastNote = noteName
+                        lastCents = cents
+                        lastConfidence = conf
+                        _uiState.update { ui ->
+                            ui.copy(
+                                detectedNote = noteName,
+                                detectedFrequency = result.detectedFrequency,
+                                centsDeviation = cents,
+                                confidence = conf,
+                                micLevel = conf.coerceIn(0f, 1f)
+                            )
+                        }
                     }
                 } else {
-                    // Silêncio ou baixa confiança — mantém a última nota visível
-                    // mas zera a confiança para indicar instabilidade
-                    _uiState.update { it.copy(confidence = 0f, micLevel = 0f) }
+                    // Silêncio ou baixa confiança — emite apenas na transição
+                    // (evita spam de copy() a cada frame sem sinal).
+                    if (!silenceEmitted) {
+                        silenceEmitted = true
+                        lastConfidence = 0f
+                        _uiState.update { it.copy(confidence = 0f, micLevel = 0f) }
+                    }
                 }
             }
             .launchIn(viewModelScope)
@@ -84,29 +116,34 @@ class TunerViewModel @Inject constructor(
     fun onStartTuner() {
         viewModelScope.launch(dispatchers.default) {
             _uiState.update { it.copy(isLoading = true) }
-            runCatching { startTuner() }
-                .onSuccess { _uiState.update { it.copy(isListening = true) } }
-                .onFailure { error ->
-                    _uiState.update { it.copy(errorMessage = error.message) }
-                }
+            try {
+                startTuner()
+                _uiState.update { it.copy(isListening = true) }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(errorMessage = e.message) }
+            }
             _uiState.update { it.copy(isLoading = false) }
         }
     }
 
     fun onStopTuner() {
         viewModelScope.launch(dispatchers.default) {
-            runCatching { stopTuner() }
-                .onSuccess {
-                    _uiState.update {
-                        it.copy(
-                            isListening = false,
-                            detectedNote = "--",
-                            detectedFrequency = 0f,
-                            centsDeviation = 0f,
-                            confidence = 0f
-                        )
-                    }
+            try {
+                stopTuner()
+                silenceEmitted = true
+                lastNote = "--"
+                lastCents = 0f
+                lastConfidence = 0f
+                _uiState.update {
+                    it.copy(
+                        isListening = false,
+                        detectedNote = "--",
+                        detectedFrequency = 0f,
+                        centsDeviation = 0f,
+                        confidence = 0f
+                    )
                 }
+            } catch (_: Exception) { /* stop é idempotente — ignora erros silenciosamente */ }
         }
     }
 
@@ -122,5 +159,12 @@ class TunerViewModel @Inject constructor(
     override fun onCleared() {
         super.onCleared()
         pitchDetector.release()
+    }
+
+    companion object {
+        // Mudança mínima em cents para emitir novo estado (1 cent — variação sutil mas real).
+        private const val CENTS_CHANGE_THRESHOLD = 1.0f
+        // Mudança mínima de confiança para emitir novo estado (5%).
+        private const val CONFIDENCE_CHANGE_THRESHOLD = 0.05f
     }
 }

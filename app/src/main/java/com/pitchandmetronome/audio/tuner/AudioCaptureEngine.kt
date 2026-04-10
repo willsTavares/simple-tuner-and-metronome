@@ -480,10 +480,10 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
     companion object {
         /**
          * Variação mínima de frequência (Hz) para emitir um novo [PitchResult].
-         * 0.3 Hz ≈ 1 cent em torno de A4 (440 Hz). Mudanças menores são ruído
-         * de estimativa do YIN, não variação real de pitch.
+         * 0.8 Hz ≈ 3 cents em torno de A4 (440 Hz). Reduz flutter de detecção
+         * mantendo responsividade para mudanças reais de pitch.
          */
-        private const val FREQUENCY_CHANGE_THRESHOLD = 0.3f
+        private const val FREQUENCY_CHANGE_THRESHOLD = 0.8f
 
         /**
          * Sentinela para [lastEmittedFrequency] indicando "nenhum pitch emitido ainda".

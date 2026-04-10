@@ -93,7 +93,7 @@ class PitchDetectorImpl @Inject constructor() : IPitchDetector {
 
     companion object {
         // Mudança mínima em Hz para emitir um novo PitchResult e alocar Note + PitchResult.
-        // 0.3 Hz ≈ 1 cent em torno de A4 — imperceptível ao ouvido, elimina flutter de alocação.
-        private const val FREQUENCY_CHANGE_THRESHOLD = 0.3f
+        // 0.8 Hz ≈ 3 cents em torno de A4 — reduz flutter sem perder responsividade.
+        private const val FREQUENCY_CHANGE_THRESHOLD = 0.8f
     }
 }
