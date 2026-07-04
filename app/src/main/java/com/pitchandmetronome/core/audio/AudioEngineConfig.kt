@@ -36,26 +36,6 @@ object AudioEngineConfig {
      */
     const val YIN_CONFIDENCE_THRESHOLD = 0.15f
 
-    /**
-     * Número de cantos de áudio lidos por chamada de [AudioRecord.read].
-     * Separado do [YIN_BUFFER_SIZE] para permitir que cada implementação
-     * ajuste o tamanho de leitura independentemente da janela de análise.
-     *
-     * 256 samples @ 48 kHz ≈ 5.3 ms por leitura — baixa latência de leitura.
-     * Usado pela implementação [AudioCaptureEngine] que faz leituras menores
-     * em um buffer de acumulação antes de chamar o YIN.
-     */
-    const val CAPTURE_FRAME_SIZE = 256
-
-    /**
-     * Correlação normalizada mínima para o [PitchDetector] baseado em NACF
-     * aceitar um pico como pitch válido. Espelha [PitchDetector.ACF_CONFIDENCE_THRESHOLD].
-     * Separado de [YIN_CONFIDENCE_THRESHOLD] porque os dois algoritmos usam
-     * escalas invertidas: NACF busca máximos próximos de 1.0; YIN busca
-     * mínimos próximos de 0.0.
-     */
-    const val ACF_CONFIDENCE_THRESHOLD = 0.50f
-
     /** Frequência de referência padrão para A4 (diapasão padrão ISO 16). */
     const val DEFAULT_REFERENCE_A4_HZ = 440f
 

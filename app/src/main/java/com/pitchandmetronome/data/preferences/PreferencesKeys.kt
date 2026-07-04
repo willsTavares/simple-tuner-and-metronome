@@ -25,4 +25,5 @@ object PreferencesKeys {
     val TUNER_REFERENCE_A4 = floatPreferencesKey("tuner_reference_a4")
     val TUNER_SAMPLE_RATE = intPreferencesKey("tuner_sample_rate")
     val TUNER_BUFFER_SIZE = intPreferencesKey("tuner_buffer_size")
+    val TUNER_PRECISION_MODE = stringPreferencesKey("tuner_precision_mode")
 }

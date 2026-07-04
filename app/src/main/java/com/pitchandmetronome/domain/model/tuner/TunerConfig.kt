@@ -11,9 +11,12 @@ import com.pitchandmetronome.core.audio.AudioEngineConfig
  * @param sampleRate Taxa de amostragem do stream de captura. Deve corresponder
  *   à taxa nativa do dispositivo para evitar re-sampling.
  * @param bufferSize Número de amostras por frame de análise YIN.
+ * @param precisionMode Trade-off entre resposta e estabilidade escolhido pelo
+ *   usuário. Controla suavização e histerese na engine e na UI.
  */
 data class TunerConfig(
     val referenceA4: Float = AudioEngineConfig.DEFAULT_REFERENCE_A4_HZ,
     val sampleRate: Int = AudioEngineConfig.PREFERRED_SAMPLE_RATE,
-    val bufferSize: Int = AudioEngineConfig.YIN_BUFFER_SIZE
+    val bufferSize: Int = AudioEngineConfig.YIN_BUFFER_SIZE,
+    val precisionMode: TunerPrecisionMode = TunerPrecisionMode.DEFAULT
 )

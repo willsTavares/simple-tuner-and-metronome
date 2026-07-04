@@ -92,8 +92,11 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
     // Pré-alocados em startDetection; reutilizados em cada iteração do loop.
     // @Volatile garante visibilidade cross-thread (captureThread lê, main thread aloca).
     //
-    // captureBuffer : PCM bruto lido do AudioRecord (16-bit signed integer)
-    // floatBuffer   : PCM normalizado [-1.0, 1.0] para o algoritmo YIN
+    // captureBuffer : PCM bruto lido do AudioRecord (16-bit signed integer).
+    //                 Tamanho = bufferSize / 2 (hop) — cada leitura avança meia
+    //                 janela, dando 50% de sobreposição entre análises YIN.
+    // floatBuffer   : Janela deslizante normalizada [-1.0, 1.0] para o YIN.
+    //                 Tamanho = bufferSize (janela completa de análise).
     // yinBuffer     : Buffer de diferença do YIN — tamanho = bufferSize / 2
     //
     @Volatile private var captureBuffer = ShortArray(0)
@@ -102,6 +105,15 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
 
     @Volatile private var currentConfig          = TunerConfig()
     @Volatile private var lastEmittedFrequency   = FREQUENCY_IDLE
+
+    // Frequência suavizada por EMA. FREQUENCY_IDLE = inativo / sem detecção anterior.
+    // Reduz o jitter frame-a-frame do YIN antes de qualquer emissão para a UI.
+    @Volatile private var smoothedFrequency      = FREQUENCY_IDLE
+
+    // Lag mínimo do YIN, derivado do sample rate real em startDetection.
+    // sampleRate / 4200 Hz ≈ 11 @ 48 kHz — impede que vales espúrios em lags
+    // minúsculos (ruído de alta frequência) sejam aceitos como pitch.
+    @Volatile private var tauMin                 = TAU_MIN_FLOOR
 
     // Instalado quando o Flow tem um coletor ativo. Chamado da capture thread.
     // @Volatile: escrito pelo coletor do Flow (main/Default), lido pela capture thread.
@@ -119,8 +131,9 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
      * Flow de resultados de detecção de pitch.
      *
      * Emite [PitchResult] quando uma frequência é detectada com confiança acima
-     * de [AudioEngineConfig.YIN_CONFIDENCE_THRESHOLD] e com variação superior a
-     * [FREQUENCY_CHANGE_THRESHOLD] Hz em relação à última emissão.
+     * de [AudioEngineConfig.YIN_CONFIDENCE_THRESHOLD] e com variação (em cents,
+     * conforme o [TunerPrecisionMode] ativo) superior ao limiar de emissão.
+     * A frequência emitida é suavizada por EMA com reset em saltos de nota.
      *
      * Emite `null` quando não há sinal suficiente ou em silêncio — permite que
      * a UI exiba um indicador de "ouvindo" sem congelar na última nota.
@@ -131,16 +144,41 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
         // e de `channel` (trySend) é feita no momento da criação.
         pitchCallback = PitchDataCallback { frequencyHz, confidence ->
             if (frequencyHz > 0f && FrequencyUtils.isInMusicalRange(frequencyHz)) {
-                // Só aloca Note + PitchResult quando a variação de pitch é audível.
-                // Abaixo do limiar, o frame anterior ainda representa o pitch corretamente.
-                if (abs(frequencyHz - lastEmittedFrequency) >= FREQUENCY_CHANGE_THRESHOLD) {
-                    lastEmittedFrequency = frequencyHz
-                    val note = FrequencyUtils.frequencyToNote(frequencyHz, currentConfig.referenceA4)
-                    trySend(PitchResult(frequencyHz, note, confidence))
+                val config = currentConfig
+                val mode = config.precisionMode
+
+                // EMA com reset automático em saltos grandes (> ~0.7 semitom).
+                // Jitter pequeno é suavizado; mudanças intencionais de nota
+                // resetam a média e são seguidas imediatamente.
+                val previous = smoothedFrequency
+                val ema: Float = if (previous <= 0f) {
+                    frequencyHz
+                } else {
+                    val ratio = frequencyHz / previous
+                    if (ratio > EMA_RESET_RATIO || ratio < 1f / EMA_RESET_RATIO) {
+                        frequencyHz
+                    } else {
+                        mode.frequencyEmaAlpha * frequencyHz +
+                            (1f - mode.frequencyEmaAlpha) * previous
+                    }
+                }
+                smoothedFrequency = ema
+
+                // Limiar de emissão em cents (não Hz): sensibilidade uniforme em
+                // toda a faixa. Para desvios pequenos, Δf ≈ f × cents × ln(2)/1200 —
+                // evita log2 no hot path. Só aloca Note + PitchResult quando a
+                // variação é perceptível; abaixo disso o resultado anterior vale.
+                val last = lastEmittedFrequency
+                val thresholdHz = last * mode.emissionThresholdCents * HZ_PER_CENT_RATIO
+                if (last <= 0f || abs(ema - last) >= thresholdHz) {
+                    lastEmittedFrequency = ema
+                    val note = FrequencyUtils.frequencyToNote(ema, config.referenceA4)
+                    trySend(PitchResult(ema, note, confidence))
                 }
             } else {
                 // Silêncio ou baixa confiança — emite null apenas na transição
                 // (evita spam de nulls a cada frame sem sinal).
+                smoothedFrequency = FREQUENCY_IDLE
                 if (lastEmittedFrequency != FREQUENCY_IDLE) {
                     lastEmittedFrequency = FREQUENCY_IDLE
                     trySend(null)
@@ -166,14 +204,20 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
         check(!isRunning.get()) { "AudioCaptureEngine já em execução. Chame stopDetection() antes." }
         currentConfig          = config
         lastEmittedFrequency   = FREQUENCY_IDLE
+        smoothedFrequency      = FREQUENCY_IDLE
 
         val bufferSize = config.bufferSize
+
+        // Lag mínimo do YIN para o sample rate real deste stream.
+        tauMin = (config.sampleRate / MAX_DETECTABLE_FREQUENCY_HZ)
+            .toInt()
+            .coerceAtLeast(TAU_MIN_FLOOR)
 
         // Aloca buffers ANTES de iniciar o AudioRecord.
         // Evitar alocação depois que o stream está ativo reduz o risco de pausa de GC
         // no momento em que o hardware já está entregando amostras.
-        captureBuffer = ShortArray(bufferSize)
-        floatBuffer   = FloatArray(bufferSize)
+        captureBuffer = ShortArray(bufferSize / 2)  // hop de meia janela → 50% de sobreposição
+        floatBuffer   = FloatArray(bufferSize)      // janela deslizante de análise
         yinBuffer     = FloatArray(bufferSize / 2)  // YIN analisa lags de 1 até bufferSize/2
 
         val minBufferBytes = AudioRecord.getMinBufferSize(
@@ -238,6 +282,17 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
         captureThread = null
     }
 
+    /**
+     * Atualiza a configuração a quente — sem parar a captura.
+     *
+     * `referenceA4` e `precisionMode` são lidos a cada frame pelo callback do
+     * [pitchFlow], então passam a valer imediatamente. `sampleRate`/`bufferSize`
+     * só têm efeito no próximo [startDetection].
+     */
+    override fun updateConfig(config: TunerConfig) {
+        currentConfig = config
+    }
+
     override fun isActive(): Boolean = isRunning.get()
 
     /**
@@ -280,43 +335,49 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
 
         // Referências locais — cada acesso a campo @Volatile é uma leitura de memória com
         // barreira. Guardamo-las em locals uma vez para reutilizar nas N iterações do loop.
-        val pcm    = captureBuffer
-        val floats = floatBuffer
+        val pcm    = captureBuffer   // hop: meia janela por leitura
+        val window = floatBuffer     // janela deslizante de análise (bufferSize samples)
         val yin    = yinBuffer
         val sr     = sampleRate
-        // Cache de pcm.size como val local: embora `pcm` já seja local (sem leitura @Volatile),
-        // guardar o tamanho evita o field read `ShortArray.length` em cada iteração e
-        // documenta explicitamente que o tamanho é imutável durante o loop.
-        val pcmSize = pcm.size
+        val hop        = pcm.size
+        val windowSize = window.size
+
+        // Samples válidos acumulados no fim da janela. A análise só começa quando
+        // a janela enche (2 leituras) — evita analisar uma janela meio-zerada no início.
+        var filled = 0
 
         while (isRunning.get()) {
-            // read() bloqueante: a thread dorme até pcmSize samples estarem disponíveis.
-            // READ_BLOCKING é o padrão; explicitado aqui para clareza de intenção.
-            val samplesRead = record.read(pcm, 0, pcmSize, AudioRecord.READ_BLOCKING)
+            // read() bloqueante: a thread dorme até `hop` samples estarem disponíveis.
+            // Ler meia janela por vez dobra a taxa de análise (~23 Hz @ 4096/48kHz)
+            // com 50% de sobreposição entre janelas consecutivas.
+            val samplesRead = record.read(pcm, 0, hop, AudioRecord.READ_BLOCKING)
 
-            // `if` direto em vez de `when {}` sem argumento: semânticamente equivalente
-            // (ambos compilam para if/else chain), mas `if` deixa o fluxo mais explícito.
             if (samplesRead <= 0) {
                 // ERROR (-1): falha de hardware transiente — continua tentando.
                 // Se isRunning foi setado false durante o read() bloqueante, encerra.
                 if (!isRunning.get()) break
                 continue
-                // Leitura parcial (samplesRead in 1 until pcmSize): improvável com
-                // READ_BLOCKING, mas aceita — detectPitchAndNotify usa `samplesRead`
-                // como length e não lê além desse índice.
             }
 
-            // ── Normalização: SHORT [-32768..32767] → FLOAT [-1.0..1.0] ──────
+            // ── Janela deslizante: shift + append ─────────────────────────
             //
-            // 32768f é uma constante de compile-time. O JIT do Android (ART) converte
-            // divisão por constante em multiplicação por reciprocal, que é 2–4× mais
-            // rápido em hardware ARM/x86 sem FPU division.
+            // Desloca o conteúdo antigo para o início e escreve as amostras novas
+            // normalizadas no fim. arraycopy é intrínseco (memmove) — custo
+            // desprezível comparado ao YIN O(N²).
+            //
+            // Normalização SHORT → FLOAT: divisão por constante de compile-time;
+            // o JIT do ART converte em multiplicação por reciprocal.
+            System.arraycopy(window, samplesRead, window, 0, windowSize - samplesRead)
+            val base = windowSize - samplesRead
             for (i in 0 until samplesRead) {
-                floats[i] = pcm[i] / 32768f
+                window[base + i] = pcm[i] / 32768f
             }
 
-            // ── Detecção de pitch (YIN) ────────────────────────────────────
-            detectPitchAndNotify(floats, samplesRead, sr, yin)
+            filled = (filled + samplesRead).coerceAtMost(windowSize)
+            if (filled < windowSize) continue
+
+            // ── Detecção de pitch (YIN) sobre a janela completa ────────────
+            detectPitchAndNotify(window, windowSize, sr, yin)
         }
 
         // Encerramento limpo dentro da própria thread — sem race condition com stopDetection().
@@ -362,7 +423,8 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
         // Portanto o pitch corresponde ao primeiro mínimo de d(τ) próximo a zero.
         //
         // Complexidade: O(W/2 × W) ≈ 8,4M ops para W=4096.
-        // A taxa de análise é ~sampleRate/bufferSize ≈ 11,7 Hz → 85ms entre frames.
+        // Com sobreposição de 50%, a taxa de análise é ~sampleRate/(bufferSize/2)
+        // ≈ 23,4 Hz → 43ms entre frames.
         // Otimização futura: substituir pela versão FFT em O(W log W) se necessário.
         //
         yinBuf[0] = 0f
@@ -403,7 +465,7 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
         // mínimo local mais próximo. Reduz erros de estimativa de pitch.
         //
         var tauEstimate = -1
-        var tau = TAU_MIN
+        var tau = tauMin  // lag mínimo dinâmico: sampleRate / 4200 Hz (campo @Volatile)
         while (tau < halfLen) {
             if (yinBuf[tau] < AudioEngineConfig.YIN_CONFIDENCE_THRESHOLD) {
                 while (tau + 1 < halfLen && yinBuf[tau + 1] < yinBuf[tau]) tau++
@@ -471,7 +533,7 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
      *   chamada com `float` primitivo. **Zero alocação por chamada.**
      *
      * Esse ganho é especialmente relevante aqui porque [onPitch] é chamado a cada frame
-     * YIN (~12 Hz durante detecção ativa), totalizando ~24 objetos Float/s eliminados.
+     * YIN (~23 Hz durante detecção ativa), totalizando ~47 objetos Float/s eliminados.
      */
     private fun interface PitchDataCallback {
         fun onPitch(frequencyHz: Float, confidence: Float)
@@ -479,33 +541,47 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
 
     companion object {
         /**
-         * Variação mínima de frequência (Hz) para emitir um novo [PitchResult].
-         * 0.8 Hz ≈ 3 cents em torno de A4 (440 Hz). Reduz flutter de detecção
-         * mantendo responsividade para mudanças reais de pitch.
-         */
-        private const val FREQUENCY_CHANGE_THRESHOLD = 0.8f
-
-        /**
-         * Sentinela para [lastEmittedFrequency] indicando "nenhum pitch emitido ainda".
-         * -1f é fora da faixa musical válida (≥ 20 Hz), portanto nunca colide
-         * com uma frequência real.
+         * Sentinela para [lastEmittedFrequency] e [smoothedFrequency] indicando
+         * "nenhum pitch emitido ainda". -1f é fora da faixa musical válida
+         * (≥ 20 Hz), portanto nunca colide com uma frequência real.
          */
         private const val FREQUENCY_IDLE = -1f
 
         /**
-         * Lag mínimo analisado pelo YIN.
-         * τ = 1 corresponderia a f = sampleRate / 1 = sampleRate Hz (acima de Nyquist).
-         * τ = 2 é o menor lag fisicamente significativo.
-         * Adicionalmente, frequências > sampleRate/TAU_MIN são filtradas por
-         * [FrequencyUtils.isInMusicalRange].
+         * Razão de frequência que define um "salto grande" (≈ 0.7 semitom).
+         * Acima deste threshold, a EMA é resetada para seguir a nova nota
+         * imediatamente. Deliberadamente menor que um semitom (1.059) para que
+         * mudanças de notas adjacentes não fiquem presas na suavização.
          */
-        private const val TAU_MIN = 2
+        private const val EMA_RESET_RATIO = 1.04f
+
+        /**
+         * Conversão de cents para razão de frequência em desvios pequenos:
+         * Δf ≈ f × cents × ln(2)/1200. Aproximação linear de 2^(cents/1200) − 1,
+         * exata o suficiente (< 0.1% de erro) para limiares de poucos cents —
+         * evita log2/pow no hot path do callback.
+         */
+        private const val HZ_PER_CENT_RATIO = 5.7762e-4f
+
+        /**
+         * Frequência máxima detectável (Hz). C8 do piano ≈ 4186 Hz.
+         * Define o lag mínimo do YIN: τ_min = sampleRate / 4200 (≈ 11 @ 48 kHz).
+         * Lags menores só conteriam vales espúrios de ruído de alta frequência.
+         */
+        private const val MAX_DETECTABLE_FREQUENCY_HZ = 4200f
+
+        /**
+         * Piso absoluto para o lag mínimo do YIN.
+         * τ = 1 corresponderia a f = sampleRate (acima de Nyquist);
+         * τ = 2 é o menor lag fisicamente significativo.
+         */
+        private const val TAU_MIN_FLOOR = 2
 
         /**
          * Tempo máximo aguardado para a capture thread encerrar graciosamente.
          * O thread dorme dentro de `AudioRecord.read()` por no máximo
-         * bufferSize / sampleRate segundos (ex: 4096/48000 ≈ 85ms).
-         * 500ms é 5× esse valor — margem ampla mesmo em dispositivos lentos.
+         * hop / sampleRate segundos (ex: 2048/48000 ≈ 43ms).
+         * 500ms dá margem ampla mesmo em dispositivos lentos.
          */
         private const val STOP_TIMEOUT_MS = 500L
 

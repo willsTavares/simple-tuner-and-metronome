@@ -7,17 +7,15 @@ import kotlinx.coroutines.flow.Flow
 /**
  * Contrato da engine de detecção de pitch.
  *
- * A implementação concreta ([PitchDetectorImpl]) delega para código C++ via JNI,
- * que gerencia um stream AAudio de entrada (microfone) através do Oboe e
- * executa o algoritmo YIN em cada frame de amostras capturado.
+ * A implementação concreta ([AudioCaptureEngine]) captura áudio via
+ * `AudioRecord` em uma thread dedicada e executa o algoritmo YIN em cada
+ * frame de amostras capturado.
  *
  * **Contrato de threading:**
  * - [startDetection] e [stopDetection] são suspend functions — aguardam a
  *   abertura/fechamento do stream antes de retornar.
- * - [pitchFlow] emite resultados em `Dispatchers.Default`, já processados
+ * - [pitchFlow] emite resultados a partir da thread de captura, já processados
  *   pelo algoritmo YIN. Resultados `null` indicam silêncio ou baixa confiança.
- * - O callback de entrada AAudio roda em thread RT; a análise YIN ocorre
- *   em um thread de trabalho separado para não bloquear o buffer de captura.
  *
  * **Ciclo de vida:**
  * ```
@@ -49,6 +47,15 @@ interface IPitchDetector {
      * O Flow [pitchFlow] para de emitir após este ponto.
      */
     suspend fun stopDetection()
+
+    /**
+     * Atualiza a configuração a quente, sem reiniciar a captura.
+     *
+     * Aplica-se aos parâmetros lidos por frame ([TunerConfig.referenceA4] e
+     * [TunerConfig.precisionMode]). Mudanças de [TunerConfig.sampleRate] ou
+     * [TunerConfig.bufferSize] exigem [stopDetection] + [startDetection].
+     */
+    fun updateConfig(config: TunerConfig)
 
     /** Retorna `true` se o stream de entrada estiver ativo. */
     fun isActive(): Boolean

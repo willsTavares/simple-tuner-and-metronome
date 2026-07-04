@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.edit
 import com.pitchandmetronome.core.audio.AudioEngineConfig
 import com.pitchandmetronome.data.preferences.PreferencesKeys
 import com.pitchandmetronome.domain.model.tuner.TunerConfig
+import com.pitchandmetronome.domain.model.tuner.TunerPrecisionMode
 import com.pitchandmetronome.domain.repository.ITunerRepository
 import kotlinx.coroutines.flow.first
 import javax.inject.Inject
@@ -31,7 +32,10 @@ class TunerRepositoryImpl @Inject constructor(
             sampleRate = prefs[PreferencesKeys.TUNER_SAMPLE_RATE]
                 ?: AudioEngineConfig.PREFERRED_SAMPLE_RATE,
             bufferSize = prefs[PreferencesKeys.TUNER_BUFFER_SIZE]
-                ?: AudioEngineConfig.YIN_BUFFER_SIZE
+                ?: AudioEngineConfig.YIN_BUFFER_SIZE,
+            precisionMode = TunerPrecisionMode.fromName(
+                prefs[PreferencesKeys.TUNER_PRECISION_MODE]
+            )
         )
     }
 
@@ -40,6 +44,7 @@ class TunerRepositoryImpl @Inject constructor(
             prefs[PreferencesKeys.TUNER_REFERENCE_A4] = config.referenceA4
             prefs[PreferencesKeys.TUNER_SAMPLE_RATE] = config.sampleRate
             prefs[PreferencesKeys.TUNER_BUFFER_SIZE] = config.bufferSize
+            prefs[PreferencesKeys.TUNER_PRECISION_MODE] = config.precisionMode.name
         }
     }
 }

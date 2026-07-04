@@ -2,6 +2,7 @@ package com.pitchandmetronome.tuner.ui
 
 import android.Manifest
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -27,11 +28,13 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.graphics.Color
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
+import com.pitchandmetronome.domain.model.tuner.TunerPrecisionMode
 import com.pitchandmetronome.tuner.TunerViewModel
 
 @OptIn(ExperimentalPermissionsApi::class)
@@ -136,6 +139,14 @@ fun TunerScreen(
                     onReferenceA4Change = viewModel::onReferenceA4Change
                 )
 
+                Spacer(Modifier.height(8.dp))
+
+                // Modo de precisão: estabilidade vs resposta da agulha
+                PrecisionModeSelector(
+                    selected = uiState.precisionMode,
+                    onModeChange = viewModel::onPrecisionModeChange
+                )
+
                 Spacer(Modifier.height(12.dp))
 
                 // Center only the tuner block in the remaining space
@@ -189,6 +200,53 @@ fun TunerScreen(
          }
      }
  }
+
+/**
+ * Seletor compacto do modo de precisão do afinador.
+ *
+ * Três opções que controlam o trade-off entre resposta e estabilidade da
+ * agulha (suavização e histerese na engine e na UI). Mesmo estilo visual
+ * do [ReferenceA4Selector].
+ */
+@Composable
+private fun PrecisionModeSelector(
+    selected: TunerPrecisionMode,
+    onModeChange: (TunerPrecisionMode) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+            .padding(3.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        TunerPrecisionMode.entries.forEach { mode ->
+            val isSelected = mode == selected
+            Text(
+                text = when (mode) {
+                    TunerPrecisionMode.PRECISE -> "Preciso"
+                    TunerPrecisionMode.BALANCED -> "Balanceado"
+                    TunerPrecisionMode.STABLE -> "Estável"
+                },
+                fontSize = 12.sp,
+                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                color = if (isSelected) {
+                    MaterialTheme.colorScheme.onPrimary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                modifier = Modifier
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(
+                        if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent
+                    )
+                    .clickable { onModeChange(mode) }
+                    .padding(horizontal = 10.dp, vertical = 4.dp)
+            )
+        }
+    }
+}
 
 /**
  * Seletor compacto de frequência de referência A4.

@@ -5,9 +5,9 @@ minSdk = "26"
 targetSdk = "35"
 
 # Kotlin / AGP
-agp = "8.6.0"
-kotlin = "2.1.0"
-ksp = "2.1.0-1.0.29"
+agp = "9.2.1"
+kotlin = "2.2.10"
+ksp = "2.3.2"
 
 # Compose
 composeBom = "2025.02.00"
