@@ -15,6 +15,9 @@ object PreferencesKeys {
     // Tema
     val THEME_MODE = stringPreferencesKey("theme_mode")
 
+    // Onboarding
+    val ONBOARDING_SEEN = booleanPreferencesKey("onboarding_seen")
+
     // Metrônomo
     val METRONOME_BPM = intPreferencesKey("metronome_bpm")
     val METRONOME_TIME_SIGNATURE = stringPreferencesKey("metronome_time_signature")

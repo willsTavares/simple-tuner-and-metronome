@@ -6,6 +6,13 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
+// Assinatura de release lida de variáveis de ambiente — nunca de arquivos versionados.
+// Em CI (ver .github/workflows/release.yml), o keystore é decodificado de um secret
+// para um arquivo temporário e o caminho/senhas são passados por env var.
+// Localmente, sem essas variáveis, o build type "release" simplesmente fica sem
+// signingConfig (útil para inspecionar o bundle/APK sem publicar).
+val releaseKeystorePath = System.getenv("KEYSTORE_PATH")?.takeIf { it.isNotBlank() }
+
 android {
     namespace = "com.pitchandmetronome"
     compileSdk = libs.versions.compileSdk.get().toInt()
@@ -14,10 +21,23 @@ android {
         applicationId = "com.pitchandmetronome"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 1
+        // VERSION_CODE vem do número da execução do workflow (sempre crescente,
+        // requisito da Play Store). Fallback 1 para builds locais.
+        versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
         versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        if (releaseKeystorePath != null) {
+            create("release") {
+                storeFile = file(releaseKeystorePath)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
@@ -27,6 +47,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (releaseKeystorePath != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

@@ -20,6 +20,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
@@ -27,6 +29,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import com.pitchandmetronome.R
 import com.pitchandmetronome.metronome.ui.MetronomeScreen
+import com.pitchandmetronome.onboarding.OnboardingViewModel
+import com.pitchandmetronome.onboarding.ui.OnboardingDialog
 import com.pitchandmetronome.tuner.ui.TunerScreen
 import com.pitchandmetronome.ui.components.CapsuleNavItem
 import com.pitchandmetronome.ui.components.FloatingCapsuleNav
@@ -60,6 +64,9 @@ fun AppNavGraph(
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
 
+    val onboardingViewModel: OnboardingViewModel = hiltViewModel()
+    val showOnboarding by onboardingViewModel.showOnboarding.collectAsStateWithLifecycle()
+
     // Painters criados aqui — rememberVectorPainter e painterResource fazem cache
     // internamente, garantindo zero reallocation entre recomposições.
     val metronomeIcon = painterResource(R.drawable.ic_metronome)
@@ -67,14 +74,14 @@ fun AppNavGraph(
     val navItems = remember(metronomeIcon, tunerIcon) {
         listOf(
             CapsuleNavItem(
-                icon = metronomeIcon,
-                contentDescription = "Metrônomo",
-                route = AppDestination.Metronome.route
-            ),
-            CapsuleNavItem(
                 icon = tunerIcon,
                 contentDescription = "Afinador",
                 route = AppDestination.Tuner.route
+            ),
+            CapsuleNavItem(
+                icon = metronomeIcon,
+                contentDescription = "Metrônomo",
+                route = AppDestination.Metronome.route
             )
         )
     }
@@ -83,11 +90,11 @@ fun AppNavGraph(
         // NavHost ocupa a tela inteira; cada screen reserva padding próprio
         NavHost(
             navController = navController,
-            startDestination = AppDestination.Metronome.route,
+            startDestination = AppDestination.Tuner.route,
             modifier = Modifier.fillMaxSize()
         ) {
-            composable(AppDestination.Metronome.route) { MetronomeScreen() }
             composable(AppDestination.Tuner.route) { TunerScreen() }
+            composable(AppDestination.Metronome.route) { MetronomeScreen() }
         }
 
         // Botão de alternância de tema — canto superior direito
@@ -145,5 +152,10 @@ fun AppNavGraph(
                 .navigationBarsPadding()
                 .padding(bottom = 20.dp)
         )
+
+        // Introdução exibida apenas na primeira abertura do app.
+        if (showOnboarding) {
+            OnboardingDialog(onDismiss = onboardingViewModel::onDismiss)
+        }
     }
 }
