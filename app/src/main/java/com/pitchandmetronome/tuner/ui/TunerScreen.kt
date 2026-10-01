@@ -1,8 +1,12 @@
 package com.pitchandmetronome.tuner.ui
 
 import android.Manifest
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings as AndroidSettings
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -10,6 +14,7 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -20,7 +25,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.currentStateAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -28,14 +40,14 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.graphics.Color
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
-import com.pitchandmetronome.domain.model.tuner.TunerPrecisionMode
+import com.google.accompanist.permissions.shouldShowRationale
 import com.pitchandmetronome.tuner.TunerViewModel
+import com.pitchandmetronome.ui.theme.TuneColors
 
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
@@ -44,30 +56,42 @@ fun TunerScreen(
 ) {
     val uiState = viewModel.uiState.collectAsStateWithLifecycle().value
 
+    // Depois de uma negação, se o sistema não mostra mais o diálogo
+    // (!shouldShowRationale), a negação é permanente — pedir de novo não faz nada
+    // e o único caminho é a tela de configurações do app.
+    var permissionRequested by rememberSaveable { mutableStateOf(false) }
     val micPermission = rememberPermissionState(Manifest.permission.RECORD_AUDIO) { granted ->
+        permissionRequested = true
         if (granted) viewModel.onPermissionGranted() else viewModel.onPermissionDenied()
     }
+    val permanentlyDenied = permissionRequested &&
+        !micPermission.status.isGranted &&
+        !micPermission.status.shouldShowRationale
 
-    LaunchedEffect(Unit) {
+    // Reavaliado quando o status muda — inclusive ao voltar das configurações
+    // com a permissão concedida.
+    LaunchedEffect(micPermission.status.isGranted) {
         if (micPermission.status.isGranted) viewModel.onPermissionGranted()
     }
 
-    // Auto-start tuner assim que a permissão for concedida
-    LaunchedEffect(uiState.hasAudioPermission) {
-        if (uiState.hasAudioPermission && !uiState.isListening) {
+    // O microfone só fica ativo com a tela visível: para ao ir para segundo
+    // plano (tela desligada, outro app) e volta ao retornar.
+    val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateAsState()
+    val inForeground = lifecycleState.isAtLeast(Lifecycle.State.STARTED)
+    LaunchedEffect(uiState.hasAudioPermission, inForeground) {
+        if (uiState.hasAudioPermission && inForeground) {
             viewModel.onStartTuner()
+        } else {
+            viewModel.onStopTuner()
         }
     }
 
-    // Auto-stop ao sair da tela — rememberUpdatedState garante valor atualizado no onDispose
-    val currentIsListening by rememberUpdatedState(uiState.isListening)
+    // Para ao sair da aba do afinador.
     DisposableEffect(Unit) {
-        onDispose {
-            if (currentIsListening) {
-                viewModel.onStopTuner()
-            }
-        }
+        onDispose { viewModel.onStopTuner() }
     }
+
+    val context = LocalContext.current
 
     val bgColor = MaterialTheme.colorScheme.background
 
@@ -99,15 +123,41 @@ fun TunerScreen(
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = "O afinador precisa do microfone para detectar a frequência do instrumento.",
+                    text = "O afinador usa o microfone para identificar a nota que você toca. " +
+                        "O som é analisado no próprio aparelho e não é gravado nem enviado.",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center
                 )
+                if (permanentlyDenied) {
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        text = "A permissão foi negada. Ative o microfone nas configurações do app.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                }
                 Spacer(Modifier.height(24.dp))
-                Button(onClick = { micPermission.launchPermissionRequest() }) {
-                    Icon(Icons.Filled.Mic, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Conceder permissão")
+                if (permanentlyDenied) {
+                    Button(onClick = {
+                        context.startActivity(
+                            Intent(
+                                AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.fromParts("package", context.packageName, null)
+                            )
+                        )
+                    }) {
+                        Icon(Icons.Filled.Settings, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Abrir configurações")
+                    }
+                } else {
+                    Button(onClick = { micPermission.launchPermissionRequest() }) {
+                        Icon(Icons.Filled.Mic, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Permitir microfone")
+                    }
                 }
             }
         } else {
@@ -122,7 +172,7 @@ fun TunerScreen(
             ) {
                 // Title at top
                 Text(
-                    text = "Tuner",
+                    text = "Afinador",
                     fontSize = 28.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurface,
@@ -139,59 +189,74 @@ fun TunerScreen(
                     onReferenceA4Change = viewModel::onReferenceA4Change
                 )
 
-                Spacer(Modifier.height(8.dp))
-
-                // Modo de precisão: estabilidade vs resposta da agulha
-                PrecisionModeSelector(
-                    selected = uiState.precisionMode,
-                    onModeChange = viewModel::onPrecisionModeChange
-                )
-
-                Spacer(Modifier.height(12.dp))
+                uiState.errorMessage?.let { message ->
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        text = message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        textAlign = TextAlign.Center
+                    )
+                }
 
                 // Center only the tuner block in the remaining space
                 Spacer(Modifier.weight(0.35f))
 
-                // O bloco do afinador agrupado em uma Column para centralizar
+                // Cor única do estado de afinação — nota, cents, texto e agulha
+                // sempre concordam. Sem sinal, a última nota fica esmaecida.
+                val onSurface = MaterialTheme.colorScheme.onSurface
+                val tuneColor = when {
+                    !uiState.isListening || uiState.detectedNote == "--" -> onSurface.copy(alpha = 0.20f)
+                    !uiState.hasSignal -> onSurface.copy(alpha = 0.35f)
+                    else -> TuneColors.forTuning(uiState.isInTune, uiState.centsDeviation)
+                }
+                val animatedTuneColor by animateColorAsState(
+                    targetValue = tuneColor,
+                    animationSpec = tween(200),
+                    label = "TuneColor"
+                )
+
                 Column(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    // Exibição da nota
                     NoteDisplay(
                         noteName = uiState.detectedNote,
-                        centsDeviation = uiState.centsDeviation,
-                        isListening = uiState.isListening
+                        color = animatedTuneColor
                     )
 
-                    Spacer(Modifier.height(8.dp))
+                    CentsDisplay(
+                        cents = uiState.centsDeviation,
+                        hasSignal = uiState.hasSignal,
+                        color = animatedTuneColor
+                    )
 
-                    // Texto de status
+                    Spacer(Modifier.height(6.dp))
+
                     TunerIndicator(
                         isListening = uiState.isListening,
-                        confidence = uiState.confidence,
+                        hasSignal = uiState.hasSignal,
+                        isInTune = uiState.isInTune,
                         centsDeviation = uiState.centsDeviation
+                    )
+
+                    Spacer(Modifier.height(28.dp))
+
+                    TuningNeedle(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp),
+                        centsDeviation = uiState.centsDeviation,
+                        hasSignal = uiState.hasSignal,
+                        isInTune = uiState.isInTune,
+                        color = animatedTuneColor
                     )
 
                     Spacer(Modifier.height(4.dp))
 
-                    // Frequência
                     FrequencyDisplay(
                         frequency = uiState.detectedFrequency,
-                        centsDeviation = uiState.centsDeviation,
-                        isListening = uiState.isListening,
-                        confidence = uiState.confidence
-                    )
-
-                    Spacer(Modifier.height(24.dp))
-
-                    // Barra vertical
-                    TuningNeedle(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp),
-                        centsDeviation = uiState.centsDeviation,
-                        confidence = uiState.confidence
+                        hasSignal = uiState.hasSignal
                     )
                 }
 
@@ -200,53 +265,6 @@ fun TunerScreen(
          }
      }
  }
-
-/**
- * Seletor compacto do modo de precisão do afinador.
- *
- * Três opções que controlam o trade-off entre resposta e estabilidade da
- * agulha (suavização e histerese na engine e na UI). Mesmo estilo visual
- * do [ReferenceA4Selector].
- */
-@Composable
-private fun PrecisionModeSelector(
-    selected: TunerPrecisionMode,
-    onModeChange: (TunerPrecisionMode) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Row(
-        modifier = modifier
-            .clip(RoundedCornerShape(12.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-            .padding(3.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        TunerPrecisionMode.entries.forEach { mode ->
-            val isSelected = mode == selected
-            Text(
-                text = when (mode) {
-                    TunerPrecisionMode.PRECISE -> "Preciso"
-                    TunerPrecisionMode.BALANCED -> "Balanceado"
-                    TunerPrecisionMode.STABLE -> "Estável"
-                },
-                fontSize = 12.sp,
-                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
-                color = if (isSelected) {
-                    MaterialTheme.colorScheme.onPrimary
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                },
-                modifier = Modifier
-                    .clip(RoundedCornerShape(9.dp))
-                    .background(
-                        if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent
-                    )
-                    .clickable { onModeChange(mode) }
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
-            )
-        }
-    }
-}
 
 /**
  * Seletor compacto de frequência de referência A4.

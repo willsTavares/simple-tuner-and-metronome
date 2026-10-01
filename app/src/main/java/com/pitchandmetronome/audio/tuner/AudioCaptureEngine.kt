@@ -4,17 +4,19 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Process
-import com.pitchandmetronome.core.audio.AudioEngineConfig
 import com.pitchandmetronome.core.utils.FrequencyUtils
 import com.pitchandmetronome.domain.model.tuner.PitchResult
 import com.pitchandmetronome.domain.model.tuner.TunerConfig
+import com.pitchandmetronome.domain.tuner.PitchStabilizer
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlin.math.abs
+import kotlin.math.ceil
 
 /**
  * Engine de captura de áudio com detecção de pitch via algoritmo YIN.
@@ -33,40 +35,25 @@ import kotlin.math.abs
  * Coroutines usam um pool de threads compartilhado (`Dispatchers.Default`). Qualquer
  * task pesada no pool pode atrasar o loop de captura, causando overruns no buffer
  * interno do `AudioRecord` (amostras perdidas). Uma `Thread` dedicada com prioridade
- * `THREAD_PRIORITY_AUDIO` (-16 no scheduler Linux via `setpriority(PRIO_PROCESS)`)
- * recebe slots de CPU mais frequentes e previsíveis. `Thread.MAX_PRIORITY` do Java
- * não é suficiente — ele não altera a prioridade real do SO.
+ * `THREAD_PRIORITY_AUDIO` recebe slots de CPU mais frequentes e previsíveis.
  *
- * ### 3. Buffer pré-alocado — zero alocação no hot loop
- * [captureBuffer] (ShortArray), [floatBuffer] (FloatArray) e [yinBuffer] (FloatArray)
- * são alocados **uma vez** em [startDetection] e reutilizados em cada iteração do
- * loop de captura. Nenhuma alocação heap ocorre dentro de [captureLoop] nem dentro
- * de [detectPitchAndNotify] — eliminando pausas de GC no caminho crítico de áudio.
+ * ### 3. Buffers pré-alocados — zero alocação no hot loop
+ * Todos os arrays são alocados **uma vez** em [startDetection] e reutilizados em
+ * cada iteração — sem pausas de GC no caminho crítico de áudio.
  *
- * ### 4. Buffer interno do `AudioRecord` = max(4× mínimo, 2× frame YIN)
- * O ring-buffer interno do `AudioRecord` precisa absorver variações no scheduling da
- * thread de captura. Com 4× o tamanho mínimo, há margem para até ~3 frames atrasados
- * antes de um overrun. O `max()` com `2 × bufferSize` garante que o `AudioRecord`
- * sempre caiba pelo menos um frame completo de YIN no seu buffer.
+ * ### 4. Janela deslizante com 50% de sobreposição
+ * Cada `read()` traz meia janela; a análise roda sobre a janela completa. Dobra a
+ * taxa de análise (~23 Hz para 4096 @ 48 kHz) sem perder resolução em graves.
  *
- * ### 5. Leitura bloqueante (`READ_BLOCKING`)
- * `AudioRecord.read()` em modo bloqueante coloca a thread em sleep até que exatamente
- * `pcm.size` amostras estejam prontas. Isso é "zero CPU" enquanto não há áudio —
- * ideal para uma thread de captura que precisa acordar com alta periodicidade.
+ * ### 5. YIN + estabilização
+ * O [YinPitchDetector] produz uma estimativa bruta por frame; o [PitchStabilizer] (mediana,
+ * confirmação de salto, EMA adaptativa, hold de silêncio) transforma essa
+ * sequência em um valor estável para a UI. Toda a suavização vive ali — a UI e o
+ * ViewModel recebem um valor já pronto para exibir.
  *
- * ### 6. Algoritmo YIN com parabolic interpolation
- * YIN (de Cheveigne & Kawahara, 2002) é o algoritmo padrão para pitch monofônico.
- * Vantagens sobre FFT simples:
- * - Precisão sub-sample via interpolação parabólica (erro < 0.1 cent)
- * - Opera no domínio do tempo (sem windowing, sem spectral leakage)
- * - Thresholding integrado que elimina oitavas falsas (octave errors)
- * - O(N²/2) — para N=4096 são ~8M ops computados a ~12 Hz de análise; aceitável.
- *
- * ### 7. `callbackFlow` como bridge Thread → Flow
- * `callbackFlow` é o construtor idiomático do Kotlin para integrar callbacks (ou loops
- * em threads externas) com Flow. O canal interno bufferiza elementos enquanto o coletor
- * processa, sem bloquear a thread de captura. [pitchCallback] é instalado quando o
- * Flow tem um coletor ativo e removido quando ele é cancelado.
+ * ### 6. `callbackFlow` conflado como bridge Thread → Flow
+ * A thread de captura nunca bloqueia; se o coletor atrasar, só o resultado mais
+ * recente importa.
  *
  * ---
  * ## Ciclo de Vida
@@ -74,7 +61,7 @@ import kotlin.math.abs
  * startDetection(config)
  *   → AudioRecord iniciado
  *   → Thread de captura inicia (THREAD_PRIORITY_AUDIO)
- *     → loop: read() → normaliza → YIN → pitchCallback → Flow
+ *     → loop: read() → janela → YIN → estabilizador → pitchCallback → Flow
  * stopDetection()
  *   → isRunning = false → thread encerra loop → AudioRecord.stop/release
  * release()
@@ -92,133 +79,59 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
     // Pré-alocados em startDetection; reutilizados em cada iteração do loop.
     // @Volatile garante visibilidade cross-thread (captureThread lê, main thread aloca).
     //
-    // captureBuffer : PCM bruto lido do AudioRecord (16-bit signed integer).
-    //                 Tamanho = bufferSize / 2 (hop) — cada leitura avança meia
-    //                 janela, dando 50% de sobreposição entre análises YIN.
-    // floatBuffer   : Janela deslizante normalizada [-1.0, 1.0] para o YIN.
-    //                 Tamanho = bufferSize (janela completa de análise).
-    // yinBuffer     : Buffer de diferença do YIN — tamanho = bufferSize / 2
+    // captureBuffer : PCM bruto de cada leitura (hop = bufferSize / 2).
+    // floatBuffer   : janela deslizante normalizada [-1.0, 1.0] (bufferSize).
+    // yinDetector   : YIN com seus próprios buffers de trabalho.
     //
     @Volatile private var captureBuffer = ShortArray(0)
     @Volatile private var floatBuffer   = FloatArray(0)
-    @Volatile private var yinBuffer     = FloatArray(0)
+    @Volatile private var yinDetector: YinPitchDetector? = null
 
-    @Volatile private var currentConfig          = TunerConfig()
-    @Volatile private var lastEmittedFrequency   = FREQUENCY_IDLE
-
-    // Frequência suavizada por EMA. FREQUENCY_IDLE = inativo / sem detecção anterior.
-    // Reduz o jitter frame-a-frame do YIN antes de qualquer emissão para a UI.
-    @Volatile private var smoothedFrequency      = FREQUENCY_IDLE
-
-    // Lag mínimo do YIN, derivado do sample rate real em startDetection.
-    // sampleRate / 4200 Hz ≈ 11 @ 48 kHz — impede que vales espúrios em lags
-    // minúsculos (ruído de alta frequência) sejam aceitos como pitch.
-    @Volatile private var tauMin                 = TAU_MIN_FLOOR
+    @Volatile private var currentConfig = TunerConfig()
 
     // Instalado quando o Flow tem um coletor ativo. Chamado da capture thread.
-    // @Volatile: escrito pelo coletor do Flow (main/Default), lido pela capture thread.
-    //
-    // Usa `fun interface` em vez de `(Float, Float) -> Unit` para evitar boxing de Float.
-    // O tipo de função genérico `Function2<Float, Float, Unit>` recebe parâmetros boxados
-    // (java.lang.Float) em cada invocação — 2 alocações por frame YIN (~12 Hz).
-    // Com `fun interface`, o compilador Kotlin gera uma interface com método de assinatura
-    // primitiva `void onPitch(float, float)`, eliminando completamente o boxing.
+    // `fun interface` com parâmetros primitivos evita boxing de Float por frame.
     @Volatile private var pitchCallback: PitchDataCallback? = null
 
     // ── Flow público ─────────────────────────────────────────────────────────
 
     /**
-     * Flow de resultados de detecção de pitch.
-     *
-     * Emite [PitchResult] quando uma frequência é detectada com confiança acima
-     * de [AudioEngineConfig.YIN_CONFIDENCE_THRESHOLD] e com variação (em cents,
-     * conforme o [TunerPrecisionMode] ativo) superior ao limiar de emissão.
-     * A frequência emitida é suavizada por EMA com reset em saltos de nota.
-     *
-     * Emite `null` quando não há sinal suficiente ou em silêncio — permite que
-     * a UI exiba um indicador de "ouvindo" sem congelar na última nota.
+     * Resultados já estabilizados, um por frame de análise com pitch (~23 Hz).
+     * Emite `null` uma vez na transição para silêncio (após o hold do estabilizador).
      */
     override val pitchFlow: Flow<PitchResult?> = callbackFlow {
-        // SAM conversion para PitchDataCallback — lambda criado UMA vez, reutilizado
-        // em todos os frames. A captura de `this` (para lastEmittedFrequency/currentConfig)
-        // e de `channel` (trySend) é feita no momento da criação.
+        var voicedEmitted = false
         pitchCallback = PitchDataCallback { frequencyHz, confidence ->
             if (frequencyHz > 0f && FrequencyUtils.isInMusicalRange(frequencyHz)) {
-                val config = currentConfig
-                val mode = config.precisionMode
-
-                // EMA com reset automático em saltos grandes (> ~0.7 semitom).
-                // Jitter pequeno é suavizado; mudanças intencionais de nota
-                // resetam a média e são seguidas imediatamente.
-                val previous = smoothedFrequency
-                val ema: Float = if (previous <= 0f) {
-                    frequencyHz
-                } else {
-                    val ratio = frequencyHz / previous
-                    if (ratio > EMA_RESET_RATIO || ratio < 1f / EMA_RESET_RATIO) {
-                        frequencyHz
-                    } else {
-                        mode.frequencyEmaAlpha * frequencyHz +
-                            (1f - mode.frequencyEmaAlpha) * previous
-                    }
-                }
-                smoothedFrequency = ema
-
-                // Limiar de emissão em cents (não Hz): sensibilidade uniforme em
-                // toda a faixa. Para desvios pequenos, Δf ≈ f × cents × ln(2)/1200 —
-                // evita log2 no hot path. Só aloca Note + PitchResult quando a
-                // variação é perceptível; abaixo disso o resultado anterior vale.
-                val last = lastEmittedFrequency
-                val thresholdHz = last * mode.emissionThresholdCents * HZ_PER_CENT_RATIO
-                if (last <= 0f || abs(ema - last) >= thresholdHz) {
-                    lastEmittedFrequency = ema
-                    val note = FrequencyUtils.frequencyToNote(ema, config.referenceA4)
-                    trySend(PitchResult(ema, note, confidence))
-                }
-            } else {
-                // Silêncio ou baixa confiança — emite null apenas na transição
-                // (evita spam de nulls a cada frame sem sinal).
-                smoothedFrequency = FREQUENCY_IDLE
-                if (lastEmittedFrequency != FREQUENCY_IDLE) {
-                    lastEmittedFrequency = FREQUENCY_IDLE
-                    trySend(null)
-                }
+                voicedEmitted = true
+                val note = FrequencyUtils.frequencyToNote(frequencyHz, currentConfig.referenceA4)
+                trySend(PitchResult(frequencyHz, note, confidence))
+            } else if (voicedEmitted) {
+                voicedEmitted = false
+                trySend(null)
             }
         }
         awaitClose { pitchCallback = null }
-    }
+    }.buffer(Channel.CONFLATED)
 
     // ── IPitchDetector ────────────────────────────────────────────────────────
 
     /**
      * Inicializa o [AudioRecord] e inicia a thread de captura.
      *
-     * É uma `suspend fun` para que o chamador (ViewModel via use case) possa
-     * executá-la em `Dispatchers.Default` sem bloquear a Main thread durante a
-     * abertura do stream de áudio.
-     *
      * @throws IllegalStateException se já estiver ativo, se o hardware não suportar
      *   a configuração ou se a permissão RECORD_AUDIO estiver ausente.
      */
     override suspend fun startDetection(config: TunerConfig) {
         check(!isRunning.get()) { "AudioCaptureEngine já em execução. Chame stopDetection() antes." }
-        currentConfig          = config
-        lastEmittedFrequency   = FREQUENCY_IDLE
-        smoothedFrequency      = FREQUENCY_IDLE
+        currentConfig = config
 
         val bufferSize = config.bufferSize
 
-        // Lag mínimo do YIN para o sample rate real deste stream.
-        tauMin = (config.sampleRate / MAX_DETECTABLE_FREQUENCY_HZ)
-            .toInt()
-            .coerceAtLeast(TAU_MIN_FLOOR)
-
-        // Aloca buffers ANTES de iniciar o AudioRecord.
-        // Evitar alocação depois que o stream está ativo reduz o risco de pausa de GC
-        // no momento em que o hardware já está entregando amostras.
-        captureBuffer = ShortArray(bufferSize / 2)  // hop de meia janela → 50% de sobreposição
-        floatBuffer   = FloatArray(bufferSize)      // janela deslizante de análise
-        yinBuffer     = FloatArray(bufferSize / 2)  // YIN analisa lags de 1 até bufferSize/2
+        // Aloca buffers ANTES de iniciar o AudioRecord — sem GC com o stream ativo.
+        captureBuffer = ShortArray(bufferSize / 2)
+        floatBuffer   = FloatArray(bufferSize)
+        yinDetector   = YinPitchDetector(bufferSize, config.sampleRate)
 
         val minBufferBytes = AudioRecord.getMinBufferSize(
             config.sampleRate,
@@ -230,21 +143,26 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
             "Sample rate ${config.sampleRate} Hz pode não ser suportado."
         }
 
-        // Buffer interno >= max(4× mínimo, 2× frame YIN em bytes).
-        // O factor 4× absorve jitter de scheduling sem perder amostras.
-        // O factor 2× garante espaço para um frame completo enquanto processamos o anterior.
+        // Buffer interno >= max(4× mínimo, 2× janela): absorve jitter de scheduling
+        // sem perder amostras.
         val audioRecordInternalBuffer = maxOf(
             minBufferBytes * 4,
             bufferSize * Short.SIZE_BYTES * 2
         )
 
-        val record = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,  // (1) desliga AGC + noise suppression
-            config.sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            audioRecordInternalBuffer
-        )
+        // A UI só chama startDetection com RECORD_AUDIO concedida, mas a permissão
+        // pode ser revogada a qualquer momento — SecurityException vira erro tratável.
+        val record = try {
+            AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,  // desliga AGC + noise suppression
+                config.sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                audioRecordInternalBuffer
+            )
+        } catch (e: SecurityException) {
+            throw IllegalStateException("Permissão RECORD_AUDIO ausente.", e)
+        }
 
         check(record.state == AudioRecord.STATE_INITIALIZED) {
             record.release()
@@ -259,25 +177,18 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
             { captureLoop(config.sampleRate) },
             CAPTURE_THREAD_NAME
         ).apply {
-            // isDaemon = true: o processo pode encerrar mesmo se esta thread ainda estiver
-            // rodando — evita vazamento de thread ao destruir o ViewModel sem chamar release().
             isDaemon = true
             start()
         }
     }
 
     /**
-     * Para a captura com graceful shutdown.
-     *
-     * 1. Sinaliza a thread via [isRunning] = false.
-     * 2. Aguarda até [STOP_TIMEOUT_MS] para que o loop encerre sozinho.
-     * 3. O `AudioRecord.stop/release` acontece dentro da capture thread, após o loop.
-     *    Isso evita chamar `AudioRecord.stop()` de fora enquanto um `read()` bloqueante
-     *    está em andamento — o que causaria `IllegalStateException` em algumas versões.
+     * Para a captura com graceful shutdown. O `AudioRecord.stop/release` acontece
+     * dentro da capture thread, após o loop — evita chamar `stop()` de fora durante
+     * um `read()` bloqueante.
      */
     override suspend fun stopDetection() {
         if (!isRunning.getAndSet(false)) return  // Já parado — idempotente
-        lastEmittedFrequency = FREQUENCY_IDLE
         captureThread?.join(STOP_TIMEOUT_MS)
         captureThread = null
     }
@@ -285,9 +196,9 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
     /**
      * Atualiza a configuração a quente — sem parar a captura.
      *
-     * `referenceA4` e `precisionMode` são lidos a cada frame pelo callback do
-     * [pitchFlow], então passam a valer imediatamente. `sampleRate`/`bufferSize`
-     * só têm efeito no próximo [startDetection].
+     * `referenceA4` é lido a cada frame pelo callback do [pitchFlow], então passa
+     * a valer imediatamente. `sampleRate`/`bufferSize` só têm efeito no próximo
+     * [startDetection].
      */
     override fun updateConfig(config: TunerConfig) {
         currentConfig = config
@@ -298,75 +209,48 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
     /**
      * Para o engine e libera todos os recursos permanentemente.
      * Deve ser chamado em `ViewModel.onCleared()`.
-     * Após [release], este objeto não pode ser reutilizado.
      */
     override fun release() {
         isRunning.set(false)
-        // release() pode ser chamado de qualquer thread. Para não depender que
-        // captureLoop() encerre naturalmente, forçamos o release do AudioRecord aqui.
-        // captureLoop() trata audioRecord == null como sinal de encerramento.
         audioRecord?.apply {
-            // try/catch direto: runCatching { } aloca um objeto Result em cada chamada.
-            // No shutdown path não é crítico, mas é desnecessário quando o tratamento
-            // de erro é ignorar a exceção silenciosamente.
             try { stop() } catch (_: Exception) { }
             release()
         }
-        audioRecord      = null
-        captureThread    = null
+        audioRecord   = null
+        captureThread = null
     }
 
     // ── Loop de captura ───────────────────────────────────────────────────────
 
-    /**
-     * Corpo da thread de captura. Executado em [captureThread].
-     *
-     * A thread coloca-se em sleep dentro de `record.read()` até que
-     * [captureBuffer].size amostras estejam prontas, acorda, processa e volta a dormir.
-     * Isso garante que a CPU fique idle entre frames — sem busy-waiting.
-     */
     private fun captureLoop(sampleRate: Int) {
-        // Define a prioridade de scheduling no nível do OS (Linux nice value ≈ -16).
-        // Thread.priority do Java mapeia para nice values altos (baixa prioridade relativa);
-        // Process.setThreadPriority opera diretamente no scheduler do kernel.
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
 
         val record = audioRecord ?: return
+        val yin = yinDetector ?: return
 
-        // Referências locais — cada acesso a campo @Volatile é uma leitura de memória com
-        // barreira. Guardamo-las em locals uma vez para reutilizar nas N iterações do loop.
-        val pcm    = captureBuffer   // hop: meia janela por leitura
-        val window = floatBuffer     // janela deslizante de análise (bufferSize samples)
-        val yin    = yinBuffer
-        val sr     = sampleRate
+        // Locais: evita leitura @Volatile a cada iteração.
+        val pcm        = captureBuffer
+        val window     = floatBuffer
         val hop        = pcm.size
         val windowSize = window.size
 
-        // Samples válidos acumulados no fim da janela. A análise só começa quando
-        // a janela enche (2 leituras) — evita analisar uma janela meio-zerada no início.
+        // Criado na própria thread de captura — único usuário, sem concorrência.
+        val holdFrames = ceil(SILENCE_HOLD_MS / 1000f * sampleRate / hop).toInt()
+        val stabilizer = PitchStabilizer(holdFrames)
+        var lastVoicedConfidence = 0f
+
+        // A análise só começa quando a janela enche — evita analisar zeros.
         var filled = 0
 
         while (isRunning.get()) {
-            // read() bloqueante: a thread dorme até `hop` samples estarem disponíveis.
-            // Ler meia janela por vez dobra a taxa de análise (~23 Hz @ 4096/48kHz)
-            // com 50% de sobreposição entre janelas consecutivas.
             val samplesRead = record.read(pcm, 0, hop, AudioRecord.READ_BLOCKING)
 
             if (samplesRead <= 0) {
-                // ERROR (-1): falha de hardware transiente — continua tentando.
-                // Se isRunning foi setado false durante o read() bloqueante, encerra.
                 if (!isRunning.get()) break
                 continue
             }
 
-            // ── Janela deslizante: shift + append ─────────────────────────
-            //
-            // Desloca o conteúdo antigo para o início e escreve as amostras novas
-            // normalizadas no fim. arraycopy é intrínseco (memmove) — custo
-            // desprezível comparado ao YIN O(N²).
-            //
-            // Normalização SHORT → FLOAT: divisão por constante de compile-time;
-            // o JIT do ART converte em multiplicação por reciprocal.
+            // Janela deslizante: desloca o conteúdo antigo e anexa o novo no fim.
             System.arraycopy(window, samplesRead, window, 0, windowSize - samplesRead)
             val base = windowSize - samplesRead
             for (i in 0 until samplesRead) {
@@ -376,164 +260,22 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
             filled = (filled + samplesRead).coerceAtMost(windowSize)
             if (filled < windowSize) continue
 
-            // ── Detecção de pitch (YIN) sobre a janela completa ────────────
-            detectPitchAndNotify(window, windowSize, sr, yin)
+            val rawHz = yin.detect(window)
+            if (rawHz > 0f) lastVoicedConfidence = yin.confidence
+            val stableHz = stabilizer.process(rawHz)
+            pitchCallback?.onPitch(stableHz, lastVoicedConfidence)
         }
 
-        // Encerramento limpo dentro da própria thread — sem race condition com stopDetection().
-        // try/catch direto: runCatching { } cria um objeto Result mesmo no caminho feliz.
         try { record.stop() } catch (_: Exception) { }
         record.release()
         if (audioRecord === record) audioRecord = null
     }
 
-    // ── Algoritmo YIN ─────────────────────────────────────────────────────────
+    // ── Tipos e constantes ───────────────────────────────────────────────────
 
     /**
-     * Executa o pipeline YIN completo e invoca [pitchCallback] com o resultado.
-     *
-     * Passos:
-     * 1. Função de diferença
-     * 2. Diferença normalizada pela média cumulativa (CMND)
-     * 3. Limiar absoluto com ajuste ao mínimo local
-     * 4. Interpolação parabólica para precisão sub-sample
-     *
-     * **Zero alocação**: todos os arrays são pré-alocados. Nenhum objeto é criado
-     * durante a execução — garantido pela ausência de `new`, boxing, lambdas
-     * com captura ou coleções temporárias.
-     *
-     * @param samples   Amostras normalizadas [-1.0, 1.0]. Deve ter tamanho >= [length].
-     * @param length    Número de amostras válidas em [samples] (pode ser < samples.size).
-     * @param sampleRate Taxa de amostragem em Hz.
-     * @param yinBuf    Buffer de trabalho pré-alocado, tamanho >= [length] / 2.
-     */
-    private fun detectPitchAndNotify(
-        samples: FloatArray,
-        length: Int,
-        sampleRate: Int,
-        yinBuf: FloatArray
-    ) {
-        val halfLen = length / 2
-
-        // ── Passo 1 — Função de diferença ─────────────────────────────────
-        //
-        // d(τ) = Σ(j=0..W-1) [x(j) − x(j+τ)]²
-        //
-        // Para um sinal puramente periódico com período P, d(P) = 0.
-        // Portanto o pitch corresponde ao primeiro mínimo de d(τ) próximo a zero.
-        //
-        // Complexidade: O(W/2 × W) ≈ 8,4M ops para W=4096.
-        // Com sobreposição de 50%, a taxa de análise é ~sampleRate/(bufferSize/2)
-        // ≈ 23,4 Hz → 43ms entre frames.
-        // Otimização futura: substituir pela versão FFT em O(W log W) se necessário.
-        //
-        yinBuf[0] = 0f
-        for (tau in 1 until halfLen) {
-            var sum = 0f
-            // O inner loop é o gargalo. O JIT do ART vetoriza loops simples
-            // com operações aritméticas float se não houver dependências de dados.
-            for (j in 0 until halfLen) {
-                val delta = samples[j] - samples[j + tau]
-                sum += delta * delta
-            }
-            yinBuf[tau] = sum
-        }
-
-        // ── Passo 2 — Diferença normalizada pela média cumulativa (CMND) ──
-        //
-        // d'(0) = 1 (por convenção)
-        // d'(τ) = d(τ) × τ / Σ(j=1..τ) d(j)
-        //
-        // Divide a função de diferença pela sua própria média acumulada.
-        // Isso torna o limiar absoluto (Passo 3) independente da amplitude do sinal:
-        // um sinal forte e um fraco com o mesmo pitch produzem valores d' semelhantes.
-        //
-        yinBuf[0] = 1f
-        var runningSum = 0f
-        for (tau in 1 until halfLen) {
-            runningSum += yinBuf[tau]
-            // Guard: se runningSum == 0f, todos os deltas anteriores foram zero
-            // (sinal DC puro). yinBuf[tau] = 1f sinaliza "sem periodicidade".
-            yinBuf[tau] = if (runningSum > 0f) yinBuf[tau] * tau / runningSum else 1f
-        }
-
-        // ── Passo 3 — Limiar absoluto + ajuste ao mínimo local ────────────
-        //
-        // Encontra o primeiro τ ≥ TAU_MIN onde d'(τ) < threshold.
-        // "Ajuste ao mínimo local": após encontrar o primeiro cruzamento,
-        // desliza τ para frente enquanto d'(τ+1) < d'(τ) para chegar ao
-        // mínimo local mais próximo. Reduz erros de estimativa de pitch.
-        //
-        var tauEstimate = -1
-        var tau = tauMin  // lag mínimo dinâmico: sampleRate / 4200 Hz (campo @Volatile)
-        while (tau < halfLen) {
-            if (yinBuf[tau] < AudioEngineConfig.YIN_CONFIDENCE_THRESHOLD) {
-                while (tau + 1 < halfLen && yinBuf[tau + 1] < yinBuf[tau]) tau++
-                tauEstimate = tau
-                break
-            }
-            tau++
-        }
-
-        if (tauEstimate == -1) {
-            // Nenhum cruzamento de limiar encontrado — sinal não periódico.
-            // Pode ser: silêncio, ruído de banda larga, sopro, etc.
-            pitchCallback?.onPitch(0f, 0f)
-            return
-        }
-
-        // ── Passo 4 — Interpolação parabólica ─────────────────────────────
-        //
-        // O mínimo de d'(τ) raramente cai exatamente em um índice inteiro.
-        // Aproximamos o ponto de mínimo real por uma parábola pelos 3 pontos
-        // ao redor de [tauEstimate]:
-        //
-        //                       s₀ − s₂
-        //   betterTau = τ + ─────────────────────
-        //                   2 × (2s₁ − s₀ − s₂)
-        //
-        // onde s₀ = d'(τ−1), s₁ = d'(τ), s₂ = d'(τ+1).
-        // Essa refinamento reduz o erro de estimativa de pitch para < 0.1 cent.
-        //
-        val betterTau: Float = if (tauEstimate in 1 until halfLen - 1) {
-            val s0 = yinBuf[tauEstimate - 1]
-            val s1 = yinBuf[tauEstimate]
-            val s2 = yinBuf[tauEstimate + 1]
-            val denom = 2f * (2f * s1 - s0 - s2)
-            // denom ≈ 0 significa parábola degenerada (mínimo muito plano) — usa inteiro.
-            if (denom != 0f) tauEstimate + (s0 - s2) / denom else tauEstimate.toFloat()
-        } else {
-            tauEstimate.toFloat()
-        }
-
-        if (betterTau <= 0f) {
-            pitchCallback?.onPitch(0f, 0f)
-            return
-        }
-
-        // Frequência fundamental: f₀ = sampleRate / betterTau
-        val frequency = sampleRate / betterTau
-
-        // Confiança: quanto mais próximo de 0 for d'(tauEstimate), mais periódico
-        // é o sinal. Como threshold ≈ 0.15, confidence estará tipicamente em [0.85, 1.0].
-        val confidence = (1f - yinBuf[tauEstimate]).coerceIn(0f, 1f)
-
-        pitchCallback?.onPitch(frequency, confidence)
-    }
-
-    // ── Constantes ────────────────────────────────────────────────────────────
-
-    /**
-     * Interface funcional com assinatura de método primitiva.
-     *
-     * Diferença crucial em relação a `(Float, Float) -> Unit`:
-     * - Tipo de função Kotlin → JVM `Function2<Float, Float, Unit>` → parâmetros **boxados**
-     *   (java.lang.Float). Cada `.invoke()` aloca 2 objetos Float no heap.
-     * - `fun interface` com parâmetros `Float` → JVM `interface { void onPitch(float, float) }`,
-     *   chamada com `float` primitivo. **Zero alocação por chamada.**
-     *
-     * Esse ganho é especialmente relevante aqui porque [onPitch] é chamado a cada frame
-     * YIN (~23 Hz durante detecção ativa), totalizando ~47 objetos Float/s eliminados.
+     * Callback com assinatura primitiva (`void onPitch(float, float)` na JVM) —
+     * evita o boxing de Float que `(Float, Float) -> Unit` causaria a cada frame.
      */
     private fun interface PitchDataCallback {
         fun onPitch(frequencyHz: Float, confidence: Float)
@@ -541,48 +283,12 @@ class AudioCaptureEngine @Inject constructor() : IPitchDetector {
 
     companion object {
         /**
-         * Sentinela para [lastEmittedFrequency] e [smoothedFrequency] indicando
-         * "nenhum pitch emitido ainda". -1f é fora da faixa musical válida
-         * (≥ 20 Hz), portanto nunca colide com uma frequência real.
+         * Tempo que o último pitch continua exibido em frames sem sinal —
+         * cobre o decaimento de uma corda e pausas curtas sem piscar a tela.
          */
-        private const val FREQUENCY_IDLE = -1f
+        private const val SILENCE_HOLD_MS = 350f
 
-        /**
-         * Razão de frequência que define um "salto grande" (≈ 0.7 semitom).
-         * Acima deste threshold, a EMA é resetada para seguir a nova nota
-         * imediatamente. Deliberadamente menor que um semitom (1.059) para que
-         * mudanças de notas adjacentes não fiquem presas na suavização.
-         */
-        private const val EMA_RESET_RATIO = 1.04f
-
-        /**
-         * Conversão de cents para razão de frequência em desvios pequenos:
-         * Δf ≈ f × cents × ln(2)/1200. Aproximação linear de 2^(cents/1200) − 1,
-         * exata o suficiente (< 0.1% de erro) para limiares de poucos cents —
-         * evita log2/pow no hot path do callback.
-         */
-        private const val HZ_PER_CENT_RATIO = 5.7762e-4f
-
-        /**
-         * Frequência máxima detectável (Hz). C8 do piano ≈ 4186 Hz.
-         * Define o lag mínimo do YIN: τ_min = sampleRate / 4200 (≈ 11 @ 48 kHz).
-         * Lags menores só conteriam vales espúrios de ruído de alta frequência.
-         */
-        private const val MAX_DETECTABLE_FREQUENCY_HZ = 4200f
-
-        /**
-         * Piso absoluto para o lag mínimo do YIN.
-         * τ = 1 corresponderia a f = sampleRate (acima de Nyquist);
-         * τ = 2 é o menor lag fisicamente significativo.
-         */
-        private const val TAU_MIN_FLOOR = 2
-
-        /**
-         * Tempo máximo aguardado para a capture thread encerrar graciosamente.
-         * O thread dorme dentro de `AudioRecord.read()` por no máximo
-         * hop / sampleRate segundos (ex: 2048/48000 ≈ 43ms).
-         * 500ms dá margem ampla mesmo em dispositivos lentos.
-         */
+        /** Tempo máximo aguardado para a capture thread encerrar. */
         private const val STOP_TIMEOUT_MS = 500L
 
         private const val CAPTURE_THREAD_NAME = "PitchCapture"

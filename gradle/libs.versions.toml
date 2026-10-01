@@ -1,8 +1,8 @@
 [versions]
 # SDK
-compileSdk = "35"
+compileSdk = "36"
 minSdk = "26"
-targetSdk = "35"
+targetSdk = "36"
 
 # Kotlin / AGP
 agp = "9.2.1"
@@ -28,9 +28,6 @@ coroutines = "1.9.0"
 
 # DataStore
 datastore = "1.1.3"
-
-# Oboe (low-latency audio via CMake/NDK)
-oboe = "1.9.3"
 
 # Accompanist (permissions)
 accompanist = "0.36.0"

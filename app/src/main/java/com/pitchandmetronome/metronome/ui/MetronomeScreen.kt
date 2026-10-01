@@ -65,7 +65,7 @@ fun MetronomeScreen(
         ) {
             // Title — fixo no topo
             Text(
-                text = "Metronome",
+                text = "Metrônomo",
                 fontSize = 28.sp,
                 fontWeight = FontWeight.Bold,
                 color = onSurface,

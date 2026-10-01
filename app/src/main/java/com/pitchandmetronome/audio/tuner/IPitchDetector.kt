@@ -51,9 +51,9 @@ interface IPitchDetector {
     /**
      * Atualiza a configuração a quente, sem reiniciar a captura.
      *
-     * Aplica-se aos parâmetros lidos por frame ([TunerConfig.referenceA4] e
-     * [TunerConfig.precisionMode]). Mudanças de [TunerConfig.sampleRate] ou
-     * [TunerConfig.bufferSize] exigem [stopDetection] + [startDetection].
+     * Aplica-se aos parâmetros lidos por frame ([TunerConfig.referenceA4]).
+     * Mudanças de [TunerConfig.sampleRate] ou [TunerConfig.bufferSize] exigem
+     * [stopDetection] + [startDetection].
      */
     fun updateConfig(config: TunerConfig)
 

@@ -164,7 +164,7 @@ class MetronomeViewModel @Inject constructor(
 
         // Mantém apenas os últimos N taps
         while (tapTimestamps.size > maxTaps) {
-            tapTimestamps.removeFirst()
+            tapTimestamps.removeAt(0)
         }
 
         // Precisa de pelo menos 2 taps para calcular BPM

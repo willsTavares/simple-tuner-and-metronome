@@ -105,24 +105,25 @@ val LocalAppColors = staticCompositionLocalOf { DarkAppColors }
 //
 // These are DOMAIN colours, not theme-dependent — green always means "in tune",
 // red always means "out of tune", regardless of light/dark mode. They are used
-// directly by TuningNeedle, NoteDisplay and TunerIndicator.
+// directly by TuningNeedle, NoteDisplay, CentsDisplay and TunerIndicator.
 object TuneColors {
-    /** Afinado — desvio ≤ 5 cents. */
+    /** Afinado — dentro da tolerância (estado com histerese vindo do ViewModel). */
     val InTune    = Color(0xFF4CAF50)
 
-    /** Próximo — desvio ≤ 20 cents. */
+    /** Próximo — desvio ≤ 15 cents. */
     val Close     = Color(0xFFFF9800)
 
-    /** Fora — desvio > 20 cents. */
+    /** Fora — desvio > 15 cents. */
     val OutOfTune = Color(0xFFE53935)
 
     /**
-     * Retorna a cor semântica correspondente ao desvio em cents.
-     * Função pura — pode ser chamada fora de contexto Composable.
+     * Cor semântica do estado de afinação. O verde vem de [isInTune] (que já
+     * tem histerese) e não de um limiar em cents aqui — assim cor, texto e
+     * agulha nunca discordam sobre "afinado".
      */
-    fun forCents(centsDeviation: Float): Color = when {
-        abs(centsDeviation) <= 5f  -> InTune
-        abs(centsDeviation) <= 20f -> Close
+    fun forTuning(isInTune: Boolean, centsDeviation: Float): Color = when {
+        isInTune                    -> InTune
+        abs(centsDeviation) <= 15f  -> Close
         else                        -> OutOfTune
     }
 }

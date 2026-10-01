@@ -9,42 +9,34 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.pitchandmetronome.ui.theme.TuneColors
 
 /**
- * Large note name display with octave — clean minimal style.
+ * Nome da nota em destaque com a oitava menor ao lado.
+ *
+ * @param color Cor já resolvida pelo chamador (estado de afinação ou inativo).
  */
 @Composable
 fun NoteDisplay(
     modifier: Modifier = Modifier,
     noteName: String,
-    centsDeviation: Float,
-    isListening: Boolean
+    color: Color
 ) {
     val (pitchName, octave) = remember(noteName) {
         if (noteName == "--") "--" to ""
         else {
-            val oct = noteName.last().takeIf { it.isDigit() }?.toString() ?: ""
-            val name = if (oct.isNotEmpty()) noteName.dropLast(1) else noteName
-            name to oct
+            val oct = noteName.takeLastWhile { it.isDigit() }
+            noteName.dropLast(oct.length) to oct
         }
     }
-
-    val colorScheme = MaterialTheme.colorScheme
-    val inactiveColor = remember(colorScheme) { colorScheme.onSurface.copy(alpha = 0.20f) }
-    val tuneColor = if (isListening && noteName != "--")
-        TuneColors.forCents(centsDeviation)
-    else
-        inactiveColor
 
     Row(
         modifier = modifier,
@@ -58,9 +50,9 @@ fun NoteDisplay(
         ) { name ->
             Text(
                 text = name,
-                fontSize = 72.sp,
+                fontSize = 88.sp,
                 fontWeight = FontWeight.Bold,
-                color = tuneColor,
+                color = color,
                 letterSpacing = (-2).sp
             )
         }
@@ -68,10 +60,10 @@ fun NoteDisplay(
         if (octave.isNotEmpty()) {
             Text(
                 text = octave,
-                fontSize = 28.sp,
+                fontSize = 30.sp,
                 fontWeight = FontWeight.Light,
-                color = tuneColor.copy(alpha = 0.60f),
-                modifier = Modifier.padding(bottom = 10.dp, start = 2.dp)
+                color = color.copy(alpha = color.alpha * 0.6f),
+                modifier = Modifier.padding(bottom = 14.dp, start = 2.dp)
             )
         }
     }

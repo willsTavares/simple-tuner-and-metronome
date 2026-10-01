@@ -140,6 +140,14 @@ object TuningCalculator {
      */
     const val MAX_DEVIATION_CENTS = 50.0
 
+    /**
+     * Histerese do estado "afinado" exibido no afinador: entra em ≤ 3 cents
+     * (padrão de afinadores de precisão) e só sai acima de 5 cents — o resíduo
+     * de 1–2 cents de qualquer sinal real não faz o indicador piscar na borda.
+     */
+    const val IN_TUNE_ENTER_CENTS = 3f
+    const val IN_TUNE_EXIT_CENTS = 5f
+
     // ── API pública — funções puras ───────────────────────────────────────────
 
     /**

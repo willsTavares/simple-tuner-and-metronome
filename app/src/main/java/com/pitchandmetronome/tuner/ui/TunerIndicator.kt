@@ -10,47 +10,29 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import com.pitchandmetronome.ui.theme.TuneColors
-import kotlin.math.abs
 
 /**
- * Status text indicator — shows tuning state as colored text.
- * "In tune!", "High (D#)", "Low (Db)", "Waiting...", "Stopped"
+ * Texto de status com a ação a tomar: "Afinado", "Alto — abaixe", "Baixo — suba".
  */
 @Composable
 fun TunerIndicator(
     modifier: Modifier = Modifier,
     isListening: Boolean,
-    confidence: Float,
+    hasSignal: Boolean,
+    isInTune: Boolean,
     centsDeviation: Float
 ) {
-    val label: String
-    val color: androidx.compose.ui.graphics.Color
     val onSurfVar = MaterialTheme.colorScheme.onSurfaceVariant
-
-    when {
-        !isListening -> {
-            label = "Parado"
-            color = onSurfVar
-        }
-        confidence < 0.3f -> {
-            label = "Aguardando..."
-            color = onSurfVar
-        }
-        abs(centsDeviation) <= 5f -> {
-            label = "Afinado!"
-            color = TuneColors.InTune
-        }
-        centsDeviation > 0f -> {
-            label = "Alto"
-            color = TuneColors.Close
-        }
-        else -> {
-            label = "Baixo"
-            color = TuneColors.Close
-        }
+    val (label: String, color: Color) = when {
+        !isListening        -> "Parado" to onSurfVar
+        !hasSignal          -> "Toque uma nota" to onSurfVar
+        isInTune            -> "Afinado" to TuneColors.InTune
+        centsDeviation > 0f -> "Alto — abaixe" to TuneColors.forTuning(false, centsDeviation)
+        else                -> "Baixo — suba" to TuneColors.forTuning(false, centsDeviation)
     }
 
     AnimatedContent(

@@ -4,9 +4,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.pitchandmetronome.audio.tuner.IPitchDetector
 import com.pitchandmetronome.core.utils.CoroutineDispatchers
+import com.pitchandmetronome.domain.model.tuner.Note
 import com.pitchandmetronome.domain.model.tuner.TunerConfig
-import com.pitchandmetronome.domain.model.tuner.TunerPrecisionMode
 import com.pitchandmetronome.domain.repository.ITunerRepository
+import com.pitchandmetronome.domain.tuner.TuningCalculator
 import com.pitchandmetronome.domain.usecase.tuner.ObservePitchUseCase
 import com.pitchandmetronome.domain.usecase.tuner.StartTunerUseCase
 import com.pitchandmetronome.domain.usecase.tuner.StopTunerUseCase
@@ -18,7 +19,10 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
+import kotlin.math.abs
 
 /**
  * ViewModel da feature de Afinador.
@@ -28,6 +32,10 @@ import javax.inject.Inject
  * - Iniciar/parar o detector via use cases
  * - Transformar [PitchResult] em campos legíveis do [TunerUiState]
  * - Liberar recursos do detector ao ser destruído
+ *
+ * A frequência já chega estabilizada pela engine (ver
+ * [com.pitchandmetronome.domain.tuner.PitchStabilizer]); aqui só se decide
+ * qual nota exibir e se ela está afinada.
  *
  * **Fluxo de permissão:**
  * A UI (Composable) gerencia a UI de permissão via Accompanist.
@@ -47,133 +55,61 @@ class TunerViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(TunerUiState())
     val uiState: StateFlow<TunerUiState> = _uiState.asStateFlow()
 
-    // Config atual (A4 + modo de precisão), carregada do DataStore no init e
-    // mantida em memória para persistir mudanças sem reler as preferências.
+    // Config atual, carregada do DataStore no init e mantida em memória para
+    // persistir mudanças sem reler as preferências.
     @Volatile private var currentConfig = TunerConfig()
 
-    // ── Campos de deduplicação — evitam copy() quando nada mudou ─────────
-    // Comparações primitivas (Float/String) são muito mais baratas do que
-    // alocar um novo TunerUiState via copy() a cada frame (~12×/s).
-    @Volatile private var lastNote: String = "--"
-    @Volatile private var lastCents: Float = 0f
-    @Volatile private var lastConfidence: Float = 0f
-    @Volatile private var silenceEmitted: Boolean = true
+    // Nota exibida. Histerese por banda: só troca quando a frequência passa
+    // NOTE_SWITCH_CENTS da nota atual — perto da fronteira de semitom (±50) o
+    // nome não pisca, e os cents nunca são medidos contra uma nota distante.
+    @Volatile private var displayedNote: Note? = null
 
-    // ── Campos de estabilização de nota ───────────────────────────────────
-    // Implementa histérese: a nota exibida só muda após N frames consecutivos
-    // com a mesma nota detectada, evitando oscilação no limite de semitom.
-    @Volatile private var pendingNote: String = "--"
-    @Volatile private var pendingNoteCount: Int = 0
+    @Volatile private var inTune = false
 
-    // Última nota REALMENTE detectada (sem histerese) — usada só para saber
-    // quando resetar a EMA de cents. Ver comentário em [rawCents] abaixo.
-    @Volatile private var lastRawNoteName: String = "--"
-
-    // EMA aplicada ao valor de cents para suavizar a agulha.
-    @Volatile private var smoothedCents: Float = 0f
-    @Volatile private var centsInitialized: Boolean = false
+    // Start/stop chegam em rajada pelo ciclo de vida (primeiro plano, troca de
+    // aba); o mutex garante que nunca rodam intercalados.
+    private val startStopMutex = Mutex()
 
     init {
-        // Carrega a config persistida (A4 + modo de precisão) para o uiState
-        // refletir os valores salvos ao abrir a tela.
         viewModelScope.launch(dispatchers.default) {
             val config = tunerRepository.getConfig()
             currentConfig = config
-            _uiState.update {
-                it.copy(
-                    referenceA4 = config.referenceA4,
-                    precisionMode = config.precisionMode
-                )
-            }
+            _uiState.update { it.copy(referenceA4 = config.referenceA4) }
         }
 
-        // Traduz PitchResult → campos da UI com estabilização de nota e suavização.
-        //
-        // Estabilização (note confirmation):
-        //   O NOME exibido só muda após N frames consecutivos com a mesma nota
-        //   detectada (N vem do modo de precisão) — elimina o texto piscando no
-        //   limite de semitom. Afeta só o texto, não o cálculo de cents (ver abaixo).
-        //
-        // Suavização de cents (EMA):
-        //   Os cents usam sempre a nota mais próxima da frequência detectada
-        //   ([Note.centsDeviation], já limitado a (-50, +50]) — nunca a nota
-        //   "confirmada" com atraso. Usar a referência atrasada fazia a agulha
-        //   disparar para longe durante uma troca real de nota (a frequência já
-        //   estava perto da nota nova, mas os cents continuavam calculados
-        //   contra a nota antiga até a confirmação chegar) e só "estalar" de
-        //   volta quando o nome finalmente trocava — pior quanto mais frames de
-        //   confirmação o modo exigisse (Balanceado/Estável).
-        //   A EMA (α do modo de precisão) suaviza o jitter residual, e é
-        //   resetada sempre que a nota DETECTADA muda (não quando o nome exibido
-        //   muda, que tem atraso) — sem misturar cents de notas diferentes.
         observePitch()
             .onEach { result ->
-                if (result != null) {
-                    silenceEmitted = false
-                    val rawNoteName = result.note.fullName
-                    val conf = result.confidence
-                    val mode = currentConfig.precisionMode
+                if (result == null) {
+                    inTune = false
+                    _uiState.update { it.copy(hasSignal = false, isInTune = false) }
+                    return@onEach
+                }
 
-                    // 1. Note confirmation: só troca o NOME exibido após N frames consecutivos.
-                    val displayNote: String = if (rawNoteName == lastNote) {
-                        pendingNote = rawNoteName
-                        pendingNoteCount = 0
-                        lastNote
-                    } else {
-                        if (rawNoteName == pendingNote) {
-                            pendingNoteCount++
-                        } else {
-                            pendingNote = rawNoteName
-                            pendingNoteCount = 1
-                        }
-                        if (pendingNoteCount >= mode.noteConfirmationFrames) {
-                            rawNoteName
-                        } else {
-                            lastNote // mantém nome confirmado enquanto acumula frames
-                        }
-                    }
+                val frequency = result.detectedFrequency
+                var note = displayedNote
+                var cents = note?.let {
+                    TuningCalculator.centsFromReference(frequency, it.referenceFrequency)
+                }
+                if (note == null || cents == null || abs(cents) > NOTE_SWITCH_CENTS) {
+                    note = result.note
+                    cents = note.centsDeviation
+                    displayedNote = note
+                }
 
-                    // 2. Cents sempre relativos à nota mais próxima da frequência DETECTADA
-                    //    (não à exibida) + EMA para suavizar a agulha.
-                    val rawCents = result.note.centsDeviation
-                    // Reset quando a nota detectada muda de fato: misturar cents de
-                    // notas diferentes na EMA causaria um salto espúrio na agulha.
-                    val rawNoteChanged = rawNoteName != lastRawNoteName
-                    smoothedCents = if (!centsInitialized || rawNoteChanged) {
-                        centsInitialized = true
-                        rawCents
-                    } else {
-                        mode.centsEmaAlpha * rawCents + (1f - mode.centsEmaAlpha) * smoothedCents
-                    }
-                    lastRawNoteName = rawNoteName
-
-                    // 3. Deduplicação: só emite novo estado quando algo mudou visivelmente.
-                    val noteChanged = displayNote != lastNote // != por valor (não ===)
-                    val centsChanged = kotlin.math.abs(smoothedCents - lastCents) > CENTS_CHANGE_THRESHOLD
-                    val confChanged = kotlin.math.abs(conf - lastConfidence) > CONFIDENCE_CHANGE_THRESHOLD
-
-                    if (noteChanged || centsChanged || confChanged) {
-                        lastNote = displayNote
-                        lastCents = smoothedCents
-                        lastConfidence = conf
-                        _uiState.update { ui ->
-                            ui.copy(
-                                detectedNote = displayNote,
-                                detectedFrequency = result.detectedFrequency,
-                                centsDeviation = smoothedCents,
-                                confidence = conf,
-                                micLevel = conf.coerceIn(0f, 1f)
-                            )
-                        }
-                    }
+                inTune = abs(cents) <= if (inTune) {
+                    TuningCalculator.IN_TUNE_EXIT_CENTS
                 } else {
-                    // Silêncio ou baixa confiança — emite apenas na transição
-                    // (evita spam de copy() a cada frame sem sinal).
-                    if (!silenceEmitted) {
-                        silenceEmitted = true
-                        lastConfidence = 0f
-                        _uiState.update { it.copy(confidence = 0f, micLevel = 0f) }
-                    }
+                    TuningCalculator.IN_TUNE_ENTER_CENTS
+                }
+
+                _uiState.update {
+                    it.copy(
+                        hasSignal = true,
+                        detectedNote = note.fullName,
+                        detectedFrequency = frequency,
+                        centsDeviation = cents.coerceIn(-50f, 50f),
+                        isInTune = inTune
+                    )
                 }
             }
             .launchIn(viewModelScope)
@@ -186,50 +122,54 @@ class TunerViewModel @Inject constructor(
 
     /** Chamado pela UI quando a permissão RECORD_AUDIO é negada. */
     fun onPermissionDenied() {
-        _uiState.update {
-            it.copy(
-                hasAudioPermission = false,
-                errorMessage = "Permissão de microfone necessária para o afinador"
-            )
-        }
+        _uiState.update { it.copy(hasAudioPermission = false) }
     }
 
+    /** Idempotente — pode ser chamado a cada volta ao primeiro plano. */
     fun onStartTuner() {
         viewModelScope.launch(dispatchers.default) {
-            _uiState.update { it.copy(isLoading = true) }
-            try {
-                startTuner()
-                _uiState.update { it.copy(isListening = true) }
-            } catch (e: Exception) {
-                _uiState.update { it.copy(errorMessage = e.message) }
+            startStopMutex.withLock {
+                if (pitchDetector.isActive()) return@withLock
+                _uiState.update { it.copy(isLoading = true) }
+                try {
+                    startTuner()
+                    _uiState.update { it.copy(isListening = true, errorMessage = null) }
+                } catch (_: Exception) {
+                    _uiState.update {
+                        it.copy(errorMessage = "Não foi possível acessar o microfone. " +
+                            "Feche outros apps que estejam usando o microfone e tente novamente.")
+                    }
+                }
+                _uiState.update { it.copy(isLoading = false) }
             }
-            _uiState.update { it.copy(isLoading = false) }
         }
     }
 
+    /** Idempotente — pode ser chamado mesmo com o afinador parado. */
     fun onStopTuner() {
         viewModelScope.launch(dispatchers.default) {
-            try {
-                stopTuner()
-                silenceEmitted = true
-                lastNote = "--"
-                lastCents = 0f
-                lastConfidence = 0f
-                pendingNote = "--"
-                pendingNoteCount = 0
-                lastRawNoteName = "--"
-                smoothedCents = 0f
-                centsInitialized = false
-                _uiState.update {
-                    it.copy(
-                        isListening = false,
-                        detectedNote = "--",
-                        detectedFrequency = 0f,
-                        centsDeviation = 0f,
-                        confidence = 0f
-                    )
-                }
-            } catch (_: Exception) { /* stop é idempotente — ignora erros silenciosamente */ }
+            startStopMutex.withLock {
+                if (!pitchDetector.isActive() && !_uiState.value.isListening) return@withLock
+                stopAndReset()
+            }
+        }
+    }
+
+    private suspend fun stopAndReset() {
+        try {
+            stopTuner()
+        } catch (_: Exception) { /* stop é idempotente — ignora erros silenciosamente */ }
+        displayedNote = null
+        inTune = false
+        _uiState.update {
+            it.copy(
+                isListening = false,
+                hasSignal = false,
+                detectedNote = "--",
+                detectedFrequency = 0f,
+                centsDeviation = 0f,
+                isInTune = false
+            )
         }
     }
 
@@ -238,22 +178,10 @@ class TunerViewModel @Inject constructor(
      * (vale a partir do próximo frame) e persiste no DataStore.
      */
     fun onReferenceA4Change(frequency: Float) {
+        // A frequência de referência da nota exibida muda com o A4.
+        displayedNote = null
         _uiState.update { it.copy(referenceA4 = frequency) }
-        applyConfigChange { it.copy(referenceA4 = frequency) }
-    }
-
-    /**
-     * Troca o modo de precisão (estabilidade vs resposta): aplica a quente
-     * no detector e nos parâmetros de suavização da UI, e persiste.
-     */
-    fun onPrecisionModeChange(mode: TunerPrecisionMode) {
-        _uiState.update { it.copy(precisionMode = mode) }
-        applyConfigChange { it.copy(precisionMode = mode) }
-    }
-
-    /** Atualiza [currentConfig], propaga ao detector ativo e persiste. */
-    private fun applyConfigChange(transform: (TunerConfig) -> TunerConfig) {
-        val newConfig = transform(currentConfig)
+        val newConfig = currentConfig.copy(referenceA4 = frequency)
         currentConfig = newConfig
         pitchDetector.updateConfig(newConfig)
         viewModelScope.launch(dispatchers.default) {
@@ -273,13 +201,8 @@ class TunerViewModel @Inject constructor(
     }
 
     companion object {
-        // Frames de confirmação de nota e α da EMA de cents vêm do
-        // TunerPrecisionMode escolhido pelo usuário (currentConfig.precisionMode).
-
-        // Mudança mínima em cents para emitir novo estado (1 cent — variação sutil mas real).
-        private const val CENTS_CHANGE_THRESHOLD = 1.0f
-
-        // Mudança mínima de confiança para emitir novo estado (5%).
-        private const val CONFIDENCE_CHANGE_THRESHOLD = 0.05f
+        // Distância (cents) da nota exibida a partir da qual ela é trocada pela
+        // mais próxima. 10 cents além da fronteira de semitom.
+        private const val NOTE_SWITCH_CENTS = 60f
     }
 }

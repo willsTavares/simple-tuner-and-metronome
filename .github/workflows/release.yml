@@ -22,6 +22,10 @@ on:
 jobs:
   build-bundle:
     runs-on: ubuntu-latest
+    # O contexto `secrets` não pode ser usado em `if:` de step — o workflow é
+    # rejeitado. Exposto como env do job e testado via `env` nos steps.
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,12 +41,15 @@ jobs:
         run: chmod +x gradlew
 
       - name: Decodificar keystore
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
-        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.keystore"
+        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+
+      - name: Testes unitários
+        run: ./gradlew testDebugUnitTest --no-daemon
 
       - name: Gerar bundle assinado (.aab)
         env:
-          KEYSTORE_PATH: ${{ secrets.KEYSTORE_BASE64 != '' && format('{0}/release.keystore', runner.temp) || '' }}
+          KEYSTORE_PATH: ${{ env.KEYSTORE_BASE64 != '' && format('{0}/release.keystore', runner.temp) || '' }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
